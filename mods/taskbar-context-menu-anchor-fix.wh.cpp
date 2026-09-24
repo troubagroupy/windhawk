@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.5.0
+// @version         8.6.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -337,10 +337,16 @@ void PrepareFlyout(void* flyoutAbi, MenuAnchor const& menuAnchor) {
         return;
     }
 
-    Wh_Log(L"Flyout %s, animations enabled: %d",
+    Wh_Log(L"Flyout %s, animations enabled: %d, constrained to root: %d",
            winrt::get_class_name(flyout).c_str(),
-           flyout.AreOpenCloseAnimationsEnabled());
+           flyout.AreOpenCloseAnimationsEnabled(),
+           flyout.ShouldConstrainToRootBounds());
     flyout.AreOpenCloseAnimationsEnabled(true);
+    // A menu constrained to the taskbar's XAML island doesn't fit above the
+    // click, so XAML flips it below and plays the downward animation
+    // (seen with the battery icon's menu). Let it open as a separate window
+    // above the taskbar instead, like the other menus.
+    flyout.ShouldConstrainToRootBounds(false);
 
     // One-shot handler, removes itself when it runs.
     auto token = std::make_shared<winrt::event_token>();
