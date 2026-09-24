@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.14.0
+// @version         8.15.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -70,9 +70,18 @@ decision made for every menu flyout the taskbar opens.
 - slideAnimation: true
   $name: Slide-in animation
   $description: >-
-    Open all menus with the slide-in animation that the battery icon's menu
-    uses. When disabled, the other menus keep their roll-out animation (the
-    battery icon's menu can't use it).
+    Open all menus with a short slide up, like the battery icon's menu,
+    instead of the roll-out animation. When disabled, the other menus keep
+    their roll-out animation (the battery icon's menu can't use it).
+- slideDistance: 10
+  $name: Slide-in distance
+  $description: >-
+    How far below its final position a menu starts sliding up, in logical
+    pixels.
+- slideDuration: 100
+  $name: Slide-in duration (ms)
+  $description: >-
+    How long the slide takes. 0 makes the menu jump into place right away.
 */
 // ==/WindhawkModSettings==
 
@@ -82,11 +91,13 @@ decision made for every menu flyout the taskbar opens.
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 
 using namespace winrt::Windows::UI::Xaml;
@@ -95,6 +106,8 @@ struct {
     int zoneWidth;
     int menuGap;
     bool slideAnimation;
+    int slideDistance;
+    int slideDuration;
 } g_settings;
 
 bool IsTaskbarWindow(HWND hWnd) {
@@ -256,7 +269,8 @@ bool IsSameObject(winrt::Windows::Foundation::IUnknown const& a,
 //
 // Returns false if the open menu wasn't found (e.g. it's not open yet).
 bool CorrectOpenMenuPosition(Controls::Primitives::FlyoutBase const& flyout,
-                             MenuAnchor const& a) {
+                             MenuAnchor const& a,
+                             Controls::Primitives::Popup* popupOut = nullptr) {
     auto menuFlyout = flyout.try_as<Controls::MenuFlyout>();
     auto xamlRoot = flyout.XamlRoot();
     if (!menuFlyout || !xamlRoot || menuFlyout.Items().Size() == 0) {
@@ -317,6 +331,10 @@ bool CorrectOpenMenuPosition(Controls::Primitives::FlyoutBase const& flyout,
             popup.VerticalOffset(popup.VerticalOffset() + dy);
         }
 
+        if (popupOut) {
+            *popupOut = popup;
+        }
+
         return true;
     }
 
@@ -347,6 +365,75 @@ std::atomic<bool> g_xamlShowAtHooksInstalled;
 
 // Enables the open/close animations (some menus, e.g. the battery icon's,
 // have them disabled), and corrects the menu's position once it's open.
+// The slide-in animation: the menu's popup starts a bit lower and moves up
+// to its final position. Only one menu is open at a time, so a single timer
+// is enough.
+winrt::Windows::System::DispatcherQueueTimer g_slideTimer = nullptr;
+
+void StartSlideAnimation(Controls::Primitives::Popup const& popup) {
+    if (g_slideTimer) {
+        g_slideTimer.Stop();
+        g_slideTimer = nullptr;
+    }
+
+    double finalOffset = popup.VerticalOffset();
+    double distance = g_settings.slideDistance;
+    int duration = g_settings.slideDuration;
+    if (distance <= 0) {
+        return;
+    }
+
+    auto dispatcherQueue =
+        winrt::Windows::System::DispatcherQueue::GetForCurrentThread();
+    if (!dispatcherQueue) {
+        return;
+    }
+
+    popup.VerticalOffset(finalOffset + distance);
+
+    ULONGLONG startTime = GetTickCount64();
+    g_slideTimer = dispatcherQueue.CreateTimer();
+    g_slideTimer.Interval(std::chrono::milliseconds(10));
+    g_slideTimer.Tick([popup, finalOffset, distance, duration, startTime](
+                          winrt::Windows::System::DispatcherQueueTimer const&
+                              timer,
+                          winrt::Windows::Foundation::IInspectable const&) {
+        double progress =
+            duration > 0 ? (double)(GetTickCount64() - startTime) / duration
+                         : 1;
+        if (progress >= 1) {
+            timer.Stop();
+            progress = 1;
+        }
+
+        // Ease out (cubic).
+        double remaining = 1 - progress;
+        double eased = 1 - remaining * remaining * remaining;
+
+        try {
+            popup.VerticalOffset(finalOffset + distance * (1 - eased));
+        } catch (...) {
+            timer.Stop();
+        }
+    });
+    g_slideTimer.Start();
+}
+
+// Starts the slide-in animation once per menu opening, if enabled.
+struct SlideState {
+    bool enabled = false;
+    bool started = false;
+
+    void Start(Controls::Primitives::Popup const& popup) {
+        if (!enabled || started) {
+            return;
+        }
+
+        started = true;
+        StartSlideAnimation(popup);
+    }
+};
+
 void PrepareFlyout(void* flyoutAbi,
                    MenuAnchor const& menuAnchor,
                    bool adjustedOptions,
@@ -368,6 +455,9 @@ void PrepareFlyout(void* flyoutAbi,
         flyout.AreOpenCloseAnimationsEnabled(!g_settings.slideAnimation);
     }
 
+    auto slideState = std::make_shared<SlideState>();
+    slideState->enabled = adjustedOptions && g_settings.slideAnimation;
+
     // Correct the position in the first layout pass in which the menu is
     // open, i.e. after XAML placed it but before it's drawn, so that the
     // correction isn't visible (it would look like a jump at the start of
@@ -378,7 +468,8 @@ void PrepareFlyout(void* flyoutAbi,
         auto weakFlyout = winrt::make_weak(flyout);
         auto weakTarget = winrt::make_weak(targetElement);
         *layoutToken = targetElement.LayoutUpdated(
-            [layoutToken, attempts, weakFlyout, weakTarget, menuAnchor](
+            [layoutToken, attempts, weakFlyout, weakTarget, menuAnchor,
+             slideState](
                 winrt::Windows::Foundation::IInspectable const&,
                 winrt::Windows::Foundation::IInspectable const&) {
                 auto flyout = weakFlyout.get();
@@ -386,7 +477,12 @@ void PrepareFlyout(void* flyoutAbi,
                 bool done = !flyout || !targetElement || ++*attempts > 100;
                 if (!done) {
                     try {
-                        done = CorrectOpenMenuPosition(flyout, menuAnchor);
+                        Controls::Primitives::Popup popup = nullptr;
+                        done = CorrectOpenMenuPosition(flyout, menuAnchor,
+                                                       &popup);
+                        if (done) {
+                            slideState->Start(popup);
+                        }
                     } catch (...) {
                         HRESULT hr = winrt::to_hresult();
                         Wh_Log(L"Error %08X", hr);
@@ -406,9 +502,9 @@ void PrepareFlyout(void* flyoutAbi,
     // layout pass correction above didn't happen.
     auto token = std::make_shared<winrt::event_token>();
     *token = flyout.Opened(
-        [token, menuAnchor](winrt::Windows::Foundation::IInspectable const&
-                                sender,
-                            winrt::Windows::Foundation::IInspectable const&) {
+        [token, menuAnchor, slideState](
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Windows::Foundation::IInspectable const&) {
             auto flyout =
                 sender.try_as<Controls::Primitives::FlyoutBase>();
             if (!flyout) {
@@ -417,8 +513,16 @@ void PrepareFlyout(void* flyoutAbi,
 
             flyout.Opened(*token);
 
+            // Already positioned in a layout pass and now sliding in.
+            if (slideState->started) {
+                return;
+            }
+
             try {
-                CorrectOpenMenuPosition(flyout, menuAnchor);
+                Controls::Primitives::Popup popup = nullptr;
+                if (CorrectOpenMenuPosition(flyout, menuAnchor, &popup)) {
+                    slideState->Start(popup);
+                }
             } catch (...) {
                 HRESULT hr = winrt::to_hresult();
                 Wh_Log(L"Error %08X", hr);
@@ -832,6 +936,8 @@ void LoadSettings() {
     g_settings.zoneWidth = Wh_GetIntSetting(L"zoneWidth");
     g_settings.menuGap = Wh_GetIntSetting(L"menuGap");
     g_settings.slideAnimation = Wh_GetIntSetting(L"slideAnimation");
+    g_settings.slideDistance = Wh_GetIntSetting(L"slideDistance");
+    g_settings.slideDuration = Wh_GetIntSetting(L"slideDuration");
     Wh_Log(L"Settings loaded: zoneWidth=%d menuGap=%d slideAnimation=%d",
            g_settings.zoneWidth, g_settings.menuGap,
            g_settings.slideAnimation);
