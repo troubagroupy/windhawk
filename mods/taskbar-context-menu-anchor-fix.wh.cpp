@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.7.0
+// @version         8.6.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -75,7 +75,6 @@ decision made for every menu flyout the taskbar opens.
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
-#include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
@@ -237,19 +236,16 @@ bool IsSameObject(winrt::Windows::Foundation::IUnknown const& a,
                winrt::get_abi(b.as<winrt::Windows::Foundation::IUnknown>());
 }
 
-// Once a menu is open, measure where it actually is and move it to where it
-// should be, in case it ended up elsewhere. The popup's offsets are changed, not its window, so
+// Some menus (e.g. the battery icon's) are moved by the taskbar after they
+// open. Once a menu is open, measure where it actually is and move it to
+// where it should be. The popup's offsets are changed, not its window, so
 // that XAML's input handling stays in sync.
-//
-// Returns true if the menu is far off and allowReopen is set, in which case
-// the menu isn't moved and should be reopened instead.
-bool CorrectOpenMenuPosition(Controls::Primitives::FlyoutBase const& flyout,
-                             MenuAnchor const& a,
-                             bool allowReopen) {
+void CorrectOpenMenuPosition(Controls::Primitives::FlyoutBase const& flyout,
+                             MenuAnchor const& a) {
     auto menuFlyout = flyout.try_as<Controls::MenuFlyout>();
     auto xamlRoot = flyout.XamlRoot();
     if (!menuFlyout || !xamlRoot || menuFlyout.Items().Size() == 0) {
-        return false;
+        return;
     }
 
     auto rootContent = xamlRoot.Content();
@@ -299,10 +295,6 @@ bool CorrectOpenMenuPosition(Controls::Primitives::FlyoutBase const& flyout,
                left, top, width, height, dx, dy,
                flyout.AreOpenCloseAnimationsEnabled());
 
-        if (allowReopen && (dx > 2 || dx < -2 || dy > 2 || dy < -2)) {
-            return true;
-        }
-
         if (dx > 0.5 || dx < -0.5) {
             popup.HorizontalOffset(popup.HorizontalOffset() + dx);
         }
@@ -310,12 +302,7 @@ bool CorrectOpenMenuPosition(Controls::Primitives::FlyoutBase const& flyout,
             popup.VerticalOffset(popup.VerticalOffset() + dy);
         }
     }
-
-    return false;
 }
-
-// Set while the mod reopens a menu, see PrepareFlyout.
-thread_local bool g_reopeningMenu;
 
 // Menus that the taskbar opens without going through any of the functions
 // hooked below (for example the battery, network and volume icons' menus)
@@ -339,17 +326,9 @@ XamlShowAt_t XamlShowAt_Original;
 XamlShowAtWithOptions_t XamlShowAtWithOptions_Original;
 std::atomic<bool> g_xamlShowAtHooksInstalled;
 
-// Some menus (e.g. the battery icon's) get their items only after they
-// open, so XAML places them as if they were empty: the menu grows down and
-// to the right from the requested point, with a downward animation. The
-// taskbar disables the open/close animations of such menus, probably for
-// that reason. For these, once the menu is open, it's hidden right away
-// (without an animation) and reopened: now that it has its items, XAML
-// places it correctly, with the regular upward animation. Other menus just
-// get their position corrected if it's slightly off.
-void PrepareFlyout(void* flyoutAbi,
-                   MenuAnchor const& menuAnchor,
-                   DependencyObject const& placementTarget) {
+// Enables the open/close animations (some menus, e.g. the battery icon's,
+// have them disabled), and corrects the menu's position once it's open.
+void PrepareFlyout(void* flyoutAbi, MenuAnchor const& menuAnchor) {
     Controls::Primitives::FlyoutBase flyout = nullptr;
     ((IUnknown*)flyoutAbi)
         ->QueryInterface(winrt::guid_of<Controls::Primitives::FlyoutBase>(),
@@ -358,87 +337,38 @@ void PrepareFlyout(void* flyoutAbi,
         return;
     }
 
-    bool reopening = g_reopeningMenu;
-    bool animationsEnabled = flyout.AreOpenCloseAnimationsEnabled();
-
-    Wh_Log(L"Flyout %s, animations enabled: %d, reopening: %d",
-           winrt::get_class_name(flyout).c_str(), animationsEnabled,
-           reopening);
-
-    // Only menus with animations disabled by the taskbar are reopened, and
-    // the first opening of those stays without an animation, since it might
-    // be hidden right away.
-    bool allowReopen = !reopening && !animationsEnabled;
-
-    if (reopening && !animationsEnabled) {
-        flyout.AreOpenCloseAnimationsEnabled(true);
-
-        // Restore the setting once the menu closes, so that the menu is
-        // handled the same way the next time it opens.
-        auto closedToken = std::make_shared<winrt::event_token>();
-        *closedToken = flyout.Closed(
-            [closedToken](
-                winrt::Windows::Foundation::IInspectable const& sender,
-                winrt::Windows::Foundation::IInspectable const&) {
-                auto flyout =
-                    sender.try_as<Controls::Primitives::FlyoutBase>();
-                if (!flyout) {
-                    return;
-                }
-
-                flyout.Closed(*closedToken);
-                flyout.AreOpenCloseAnimationsEnabled(false);
-            });
-    }
+    Wh_Log(L"Flyout %s, animations enabled: %d, constrained to root: %d",
+           winrt::get_class_name(flyout).c_str(),
+           flyout.AreOpenCloseAnimationsEnabled(),
+           flyout.ShouldConstrainToRootBounds());
+    flyout.AreOpenCloseAnimationsEnabled(true);
+    // A menu constrained to the taskbar's XAML island doesn't fit above the
+    // click, so XAML flips it below and plays the downward animation
+    // (seen with the battery icon's menu). Let it open as a separate window
+    // above the taskbar instead, like the other menus.
+    flyout.ShouldConstrainToRootBounds(false);
 
     // One-shot handler, removes itself when it runs.
     auto token = std::make_shared<winrt::event_token>();
-    *token = flyout.Opened([token, menuAnchor, placementTarget, allowReopen](
-                               winrt::Windows::Foundation::IInspectable const&
-                                   sender,
-                               winrt::Windows::Foundation::IInspectable const&) {
-        auto flyout = sender.try_as<Controls::Primitives::FlyoutBase>();
-        if (!flyout) {
-            return;
-        }
-
-        flyout.Opened(*token);
-
-        try {
-            if (!CorrectOpenMenuPosition(flyout, menuAnchor, allowReopen)) {
+    *token = flyout.Opened(
+        [token, menuAnchor](winrt::Windows::Foundation::IInspectable const&
+                                sender,
+                            winrt::Windows::Foundation::IInspectable const&) {
+            auto flyout =
+                sender.try_as<Controls::Primitives::FlyoutBase>();
+            if (!flyout) {
                 return;
             }
 
-            Wh_Log(L"Menu is far off, reopening it");
+            flyout.Opened(*token);
 
-            // Animations are still disabled for this menu, so it's hidden
-            // instantly.
-            flyout.Hide();
-
-            auto dispatcherQueue =
-                winrt::Windows::System::DispatcherQueue::GetForCurrentThread();
-            if (!dispatcherQueue) {
-                Wh_Log(L"No dispatcher queue");
-                return;
+            try {
+                CorrectOpenMenuPosition(flyout, menuAnchor);
+            } catch (...) {
+                HRESULT hr = winrt::to_hresult();
+                Wh_Log(L"Error %08X", hr);
             }
-
-            dispatcherQueue.TryEnqueue([flyout, placementTarget]() {
-                try {
-                    g_reopeningMenu = true;
-                    flyout.ShowAt(
-                        placementTarget,
-                        Controls::Primitives::FlyoutShowOptions{});
-                } catch (...) {
-                    HRESULT hr = winrt::to_hresult();
-                    Wh_Log(L"Error %08X", hr);
-                }
-                g_reopeningMenu = false;
-            });
-        } catch (...) {
-            HRESULT hr = winrt::to_hresult();
-            Wh_Log(L"Error %08X", hr);
-        }
-    });
+        });
 }
 
 HRESULT WINAPI XamlShowAtWithOptions_Hook(void* pThis,
@@ -454,7 +384,7 @@ HRESULT WINAPI XamlShowAtWithOptions_Hook(void* pThis,
             winrt::copy_from_abi(options, showOptions);
             MenuAnchor menuAnchor;
             if (AdjustShowOptions(&target, &options, &menuAnchor)) {
-                PrepareFlyout(pThis, menuAnchor, target);
+                PrepareFlyout(pThis, menuAnchor);
             }
         } catch (...) {
             HRESULT hr = winrt::to_hresult();
@@ -485,7 +415,7 @@ HRESULT WINAPI XamlShowAt_Hook(void* pThis, void* placementTarget) {
                         winrt::put_abi(flyout5));
                 if (flyout5) {
                     Wh_Log(L"Redirecting ShowAt to ShowAt with options");
-                    PrepareFlyout(pThis, menuAnchor, target);
+                    PrepareFlyout(pThis, menuAnchor);
                     return XamlShowAtWithOptions_Original(
                         winrt::get_abi(flyout5), placementTarget,
                         winrt::get_abi(options));
