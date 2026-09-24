@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.11.0
+// @version         8.12.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -355,9 +355,10 @@ void PrepareFlyout(void* flyoutAbi,
     Wh_Log(L"Flyout %s, animations enabled: %d, adjusted options: %d",
            winrt::get_class_name(flyout).c_str(),
            flyout.AreOpenCloseAnimationsEnabled(), adjustedOptions);
-    if (adjustedOptions) {
-        flyout.AreOpenCloseAnimationsEnabled(true);
-    }
+    // Menus with animations disabled (e.g. the battery icon's) otherwise
+    // just slide in as a whole, instead of the roll-out animation of the
+    // other menus.
+    flyout.AreOpenCloseAnimationsEnabled(true);
 
     // Correct the position in the first layout pass in which the menu is
     // open, i.e. after XAML placed it but before it's drawn, so that the
