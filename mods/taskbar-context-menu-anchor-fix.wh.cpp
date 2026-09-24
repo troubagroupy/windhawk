@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.8.0
+// @version         8.9.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -18,7 +18,7 @@ icons (for example the Notification Center / clock area, "Adjust date and
 time" / "Notification settings") appearing far away from where you actually
 clicked.
 
-## How it works (v8.3)
+## How it works (v8.9)
 
 The taskbar's tray context menus are XAML `MenuFlyout`s. Earlier versions
 moved the finished popup window (`Xaml_WindowedPopupClass`) with
@@ -31,8 +31,9 @@ This version instead opens the tray icons' menus itself (by hooking their
 `ShowContextMenu`, the same way the "Taskbar on top" mod does), and also
 hooks the taskbar's `MenuFlyout::ShowAt` calls, and in both cases sets the
 placement it asks XAML for. Menus opened in other ways (for example the
-battery, network and volume icons' menus) are caught by a hook on the XAML
-`MenuFlyout::ShowAt` implementation itself. The menu is centered
+battery icon's menu) are caught by a hook on the XAML `MenuFlyout::ShowAt`
+implementation itself. Those are opened unchanged (changing how they're
+shown breaks their open animation) and only moved into place once open. The menu is centered
 horizontally on the click and opens just above the taskbar's top edge, with
 a configurable gap. XAML positions the popup itself, so the position and the input stay in
 sync.
@@ -112,12 +113,17 @@ struct MenuAnchor {
     RECT workArea;
 };
 
+// Set while the mod's own hooks (the tray icons' ShowContextMenu, the
+// taskbar's MenuFlyout::ShowAt calls) show a menu with adjusted options.
+thread_local bool g_inModShowAt;
+
 // Adjusts the flyout show options so that the menu opens centered on the
 // click, just above the taskbar. Returns false if the menu should be left
-// untouched.
+// untouched. With modifyOptions set to false, only menuAnchor is filled.
 bool AdjustShowOptions(DependencyObject* placementTarget,
                        Controls::Primitives::FlyoutShowOptions* showOptions,
-                       MenuAnchor* menuAnchor = nullptr) {
+                       MenuAnchor* menuAnchor = nullptr,
+                       bool modifyOptions = true) {
     POINT pt;
     if (!GetCursorPos(&pt)) {
         return false;
@@ -203,15 +209,15 @@ bool AdjustShowOptions(DependencyObject* placementTarget,
            (int)showOptions->ShowMode(), !!showOptions->ExclusionRect(),
            position.X, position.Y);
 
-    showOptions->Placement(Controls::Primitives::FlyoutPlacementMode::Top);
-    showOptions->Position(position);
-    // Explicitly request the standard (non-transient) mode that the
-    // taskbar's own context menus use.
-    showOptions->ShowMode(Controls::Primitives::FlyoutShowMode::Standard);
-    // Some menus (e.g. the battery/network/volume icons') come with an
-    // exclusion rect covering their button, which XAML keeps the menu clear
-    // of - that would push it away from the position above.
-    showOptions->ExclusionRect(nullptr);
+    if (modifyOptions) {
+        showOptions->Placement(
+            Controls::Primitives::FlyoutPlacementMode::Top);
+        showOptions->Position(position);
+        // Explicitly request the standard (non-transient) mode that the
+        // taskbar's own context menus use.
+        showOptions->ShowMode(Controls::Primitives::FlyoutShowMode::Standard);
+        showOptions->ExclusionRect(nullptr);
+    }
 
     if (menuAnchor) {
         menuAnchor->islandOrigin = islandOrigin;
@@ -328,7 +334,9 @@ std::atomic<bool> g_xamlShowAtHooksInstalled;
 
 // Enables the open/close animations (some menus, e.g. the battery icon's,
 // have them disabled), and corrects the menu's position once it's open.
-void PrepareFlyout(void* flyoutAbi, MenuAnchor const& menuAnchor) {
+void PrepareFlyout(void* flyoutAbi,
+                   MenuAnchor const& menuAnchor,
+                   bool adjustedOptions) {
     Controls::Primitives::FlyoutBase flyout = nullptr;
     ((IUnknown*)flyoutAbi)
         ->QueryInterface(winrt::guid_of<Controls::Primitives::FlyoutBase>(),
@@ -337,16 +345,12 @@ void PrepareFlyout(void* flyoutAbi, MenuAnchor const& menuAnchor) {
         return;
     }
 
-    Wh_Log(L"Flyout %s, animations enabled: %d, constrained to root: %d",
+    Wh_Log(L"Flyout %s, animations enabled: %d, adjusted options: %d",
            winrt::get_class_name(flyout).c_str(),
-           flyout.AreOpenCloseAnimationsEnabled(),
-           flyout.ShouldConstrainToRootBounds());
-    flyout.AreOpenCloseAnimationsEnabled(true);
-    // A menu constrained to the taskbar's XAML island doesn't fit above the
-    // click, so XAML flips it below and plays the downward animation
-    // (seen with the battery icon's menu). Let it open as a separate window
-    // above the taskbar instead, like the other menus.
-    flyout.ShouldConstrainToRootBounds(false);
+           flyout.AreOpenCloseAnimationsEnabled(), adjustedOptions);
+    if (adjustedOptions) {
+        flyout.AreOpenCloseAnimationsEnabled(true);
+    }
 
     // One-shot handler, removes itself when it runs.
     auto token = std::make_shared<winrt::event_token>();
@@ -382,9 +386,14 @@ HRESULT WINAPI XamlShowAtWithOptions_Hook(void* pThis,
             winrt::copy_from_abi(target, placementTarget);
             Controls::Primitives::FlyoutShowOptions options = nullptr;
             winrt::copy_from_abi(options, showOptions);
+            // Menus shown by other code (e.g. the battery icon's menu) are
+            // left as they are and only moved once they're open: changing
+            // how they're shown breaks their open animation.
+            bool adjustOptions = g_inModShowAt;
             MenuAnchor menuAnchor;
-            if (AdjustShowOptions(&target, &options, &menuAnchor)) {
-                PrepareFlyout(pThis, menuAnchor);
+            if (AdjustShowOptions(&target, &options, &menuAnchor,
+                                  adjustOptions)) {
+                PrepareFlyout(pThis, menuAnchor, adjustOptions);
             }
         } catch (...) {
             HRESULT hr = winrt::to_hresult();
@@ -399,27 +408,17 @@ HRESULT WINAPI XamlShowAtWithOptions_Hook(void* pThis,
 HRESULT WINAPI XamlShowAt_Hook(void* pThis, void* placementTarget) {
     Wh_Log(L">");
 
+    // Only shown by other code, so like above, the menu is only moved once
+    // it's open.
     if (placementTarget) {
         try {
             DependencyObject target = nullptr;
             winrt::copy_from_abi(target, placementTarget);
             Controls::Primitives::FlyoutShowOptions options;
             MenuAnchor menuAnchor;
-            if (AdjustShowOptions(&target, &options, &menuAnchor)) {
-                // Show the menu with our options instead, through the
-                // IFlyoutBase5 interface of the same object.
-                Controls::Primitives::IFlyoutBase5 flyout5 = nullptr;
-                ((IUnknown*)pThis)
-                    ->QueryInterface(
-                        winrt::guid_of<Controls::Primitives::IFlyoutBase5>(),
-                        winrt::put_abi(flyout5));
-                if (flyout5) {
-                    Wh_Log(L"Redirecting ShowAt to ShowAt with options");
-                    PrepareFlyout(pThis, menuAnchor);
-                    return XamlShowAtWithOptions_Original(
-                        winrt::get_abi(flyout5), placementTarget,
-                        winrt::get_abi(options));
-                }
+            if (AdjustShowOptions(&target, &options, &menuAnchor,
+                                  /*modifyOptions=*/false)) {
+                PrepareFlyout(pThis, menuAnchor, /*adjustedOptions=*/false);
             }
         } catch (...) {
             HRESULT hr = winrt::to_hresult();
@@ -567,9 +566,11 @@ struct ShowAtHook {
 
         EnsureXamlShowAtHooks();
 
+        bool adjusted = false;
         if (placementTarget && showOptions) {
             try {
-                if (AdjustShowOptions(placementTarget, showOptions)) {
+                adjusted = AdjustShowOptions(placementTarget, showOptions);
+                if (adjusted) {
                     // pThis is the projected flyout object, i.e. a pointer
                     // to its ABI interface pointer.
                     Controls::Primitives::FlyoutBase flyout = nullptr;
@@ -587,7 +588,9 @@ struct ShowAtHook {
             }
         }
 
+        g_inModShowAt = adjusted;
         original(pThis, placementTarget, showOptions);
+        g_inModShowAt = false;
     }
 };
 
@@ -637,7 +640,14 @@ bool ShowTrayContextMenu(void* pThis) {
     }
 
     flyout.AreOpenCloseAnimationsEnabled(true);
-    flyout.ShowAt(childElement, options);
+    g_inModShowAt = true;
+    try {
+        flyout.ShowAt(childElement, options);
+    } catch (...) {
+        g_inModShowAt = false;
+        throw;
+    }
+    g_inModShowAt = false;
     return true;
 }
 
