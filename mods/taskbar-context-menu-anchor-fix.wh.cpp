@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.15.0
+// @version         8.16.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -81,7 +81,7 @@ decision made for every menu flyout the taskbar opens.
 - slideDuration: 100
   $name: Slide-in duration (ms)
   $description: >-
-    How long the slide takes. 0 makes the menu jump into place right away.
+    How long the slide takes. 0 disables the slide.
 */
 // ==/WindhawkModSettings==
 
@@ -91,7 +91,6 @@ decision made for every menu flyout the taskbar opens.
 
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
-#include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Xaml.Controls.Primitives.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
@@ -366,57 +365,58 @@ std::atomic<bool> g_xamlShowAtHooksInstalled;
 // Enables the open/close animations (some menus, e.g. the battery icon's,
 // have them disabled), and corrects the menu's position once it's open.
 // The slide-in animation: the menu's popup starts a bit lower and moves up
-// to its final position. Only one menu is open at a time, so a single timer
-// is enough.
-winrt::Windows::System::DispatcherQueueTimer g_slideTimer = nullptr;
+// to its final position. The position is updated once per rendered frame,
+// so that the steps are even. Only one menu is open at a time, so a single
+// animation at a time is enough.
+winrt::event_token g_slideRenderingToken{};
+
+void StopSlideAnimation() {
+    if (g_slideRenderingToken) {
+        Media::CompositionTarget::Rendering(g_slideRenderingToken);
+        g_slideRenderingToken = {};
+    }
+}
 
 void StartSlideAnimation(Controls::Primitives::Popup const& popup) {
-    if (g_slideTimer) {
-        g_slideTimer.Stop();
-        g_slideTimer = nullptr;
-    }
+    StopSlideAnimation();
 
     double finalOffset = popup.VerticalOffset();
     double distance = g_settings.slideDistance;
     int duration = g_settings.slideDuration;
-    if (distance <= 0) {
-        return;
-    }
-
-    auto dispatcherQueue =
-        winrt::Windows::System::DispatcherQueue::GetForCurrentThread();
-    if (!dispatcherQueue) {
+    if (distance <= 0 || duration <= 0) {
         return;
     }
 
     popup.VerticalOffset(finalOffset + distance);
 
-    ULONGLONG startTime = GetTickCount64();
-    g_slideTimer = dispatcherQueue.CreateTimer();
-    g_slideTimer.Interval(std::chrono::milliseconds(10));
-    g_slideTimer.Tick([popup, finalOffset, distance, duration, startTime](
-                          winrt::Windows::System::DispatcherQueueTimer const&
-                              timer,
-                          winrt::Windows::Foundation::IInspectable const&) {
-        double progress =
-            duration > 0 ? (double)(GetTickCount64() - startTime) / duration
-                         : 1;
-        if (progress >= 1) {
-            timer.Stop();
-            progress = 1;
-        }
+    auto startTime = std::chrono::steady_clock::now();
+    g_slideRenderingToken = Media::CompositionTarget::Rendering(
+        [popup, finalOffset, distance, duration, startTime](
+            winrt::Windows::Foundation::IInspectable const&,
+            winrt::Windows::Foundation::IInspectable const&) {
+            double elapsed = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - startTime)
+                                 .count();
+            double progress = elapsed / duration;
+            bool finished = progress >= 1;
+            if (finished) {
+                progress = 1;
+            }
 
-        // Ease out (cubic).
-        double remaining = 1 - progress;
-        double eased = 1 - remaining * remaining * remaining;
+            // Ease out (cubic).
+            double remaining = 1 - progress;
+            double eased = 1 - remaining * remaining * remaining;
 
-        try {
-            popup.VerticalOffset(finalOffset + distance * (1 - eased));
-        } catch (...) {
-            timer.Stop();
-        }
-    });
-    g_slideTimer.Start();
+            try {
+                popup.VerticalOffset(finalOffset + distance * (1 - eased));
+            } catch (...) {
+                finished = true;
+            }
+
+            if (finished) {
+                StopSlideAnimation();
+            }
+        });
 }
 
 // Starts the slide-in animation once per menu opening, if enabled.
