@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.16.0
+// @version         8.17.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -78,7 +78,7 @@ decision made for every menu flyout the taskbar opens.
   $description: >-
     How far below its final position a menu starts sliding up, in logical
     pixels.
-- slideDuration: 100
+- slideDuration: 250
   $name: Slide-in duration (ms)
   $description: >-
     How long the slide takes. 0 disables the slide.
@@ -370,6 +370,31 @@ std::atomic<bool> g_xamlShowAtHooksInstalled;
 // animation at a time is enough.
 winrt::event_token g_slideRenderingToken{};
 
+// The easing curve that Windows uses for its "decelerate" animations,
+// cubic-bezier(0.1, 0.9, 0.2, 1): fast at first, slowing down smoothly
+// towards the end.
+double DecelerateEasing(double progress) {
+    constexpr double x1 = 0.1, y1 = 0.9, x2 = 0.2, y2 = 1.0;
+
+    auto bezier = [](double t, double p1, double p2) {
+        double u = 1 - t;
+        return 3 * u * u * t * p1 + 3 * u * t * t * p2 + t * t * t;
+    };
+
+    // Find t for which the curve's x equals progress (x is monotonic).
+    double low = 0, high = 1, t = progress;
+    for (int i = 0; i < 30; i++) {
+        t = (low + high) / 2;
+        if (bezier(t, x1, x2) < progress) {
+            low = t;
+        } else {
+            high = t;
+        }
+    }
+
+    return bezier(t, y1, y2);
+}
+
 void StopSlideAnimation() {
     if (g_slideRenderingToken) {
         Media::CompositionTarget::Rendering(g_slideRenderingToken);
@@ -403,9 +428,7 @@ void StartSlideAnimation(Controls::Primitives::Popup const& popup) {
                 progress = 1;
             }
 
-            // Ease out (cubic).
-            double remaining = 1 - progress;
-            double eased = 1 - remaining * remaining * remaining;
+            double eased = DecelerateEasing(progress);
 
             try {
                 popup.VerticalOffset(finalOffset + distance * (1 - eased));
