@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.1.0
+// @version         8.2.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -18,7 +18,7 @@ icons (for example the Notification Center / clock area, "Adjust date and
 time" / "Notification settings") appearing far away from where you actually
 clicked.
 
-## How it works (v8)
+## How it works (v8.2)
 
 The taskbar's tray context menus are XAML `MenuFlyout`s. Earlier versions
 moved the finished popup window (`Xaml_WindowedPopupClass`) with
@@ -35,13 +35,13 @@ the click and opens just above the taskbar's top edge, with a configurable
 gap. XAML positions the popup itself, so the position and the input stay in
 sync.
 
-Only menus opened while the cursor is within a configurable distance of the
-taskbar's right edge ("status bar zone" - system tray, clock,
-notification/action center) are changed. Everything else (Start button,
-pinned apps, task list, etc.) is left completely untouched.
+By default this applies to all the taskbar's XAML menus, including the
+taskbar's own right-click menu. The "Zone width" setting can limit it to
+clicks near the taskbar's right edge (system tray, clock,
+notification/action center).
 
-Note: XAML keeps popups inside the monitor's work area, so a negative gap
-might not be able to push the menu over the taskbar.
+The default gap above the taskbar (12 logical pixels) matches the Start
+menu's.
 
 ## If something looks wrong
 
@@ -52,18 +52,18 @@ decision made for every menu flyout the taskbar opens.
 
 // ==WindhawkModSettings==
 /*
-- statusBarZoneWidth: 700
-  $name: Status bar zone width (px)
+- zoneWidth: 0
+  $name: Zone width (px)
   $description: >-
-    Only clicks within this many pixels of the taskbar's right edge are
-    treated as "status bar" clicks (system tray, clock, notification/action
-    center). Clicks further left (Start button, pinned apps, task list) are
-    left completely untouched.
-- menuGapFromTaskbar: 6
-  $name: Gap above taskbar (px)
+    Only menus opened by clicks within this many pixels of the taskbar's right
+    edge are repositioned (system tray, clock, notification/action center).
+    0 means the whole taskbar, including the taskbar's own right-click menu.
+- menuGap: 12
+  $name: Gap above taskbar
   $description: >-
     Vertical gap between the bottom of the repositioned menu and the top
-    edge of the taskbar.
+    edge of the taskbar, in logical pixels (scaled with the display scale).
+    12 matches the gap of the Start menu.
 */
 // ==/WindhawkModSettings==
 
@@ -81,8 +81,8 @@ decision made for every menu flyout the taskbar opens.
 using namespace winrt::Windows::UI::Xaml;
 
 struct {
-    int statusBarZoneWidth;
-    int menuGapFromTaskbar;
+    int zoneWidth;
+    int menuGap;
 } g_settings;
 
 bool IsTaskbarWindow(HWND hWnd) {
@@ -119,15 +119,15 @@ bool AdjustShowOptions(DependencyObject* placementTarget,
         return false;
     }
 
-    bool inStatusBarZone =
-        pt.x >= taskbarRc.right - g_settings.statusBarZoneWidth;
+    bool inZone = g_settings.zoneWidth <= 0 ||
+                  pt.x >= taskbarRc.right - g_settings.zoneWidth;
 
     Wh_Log(L"Menu flyout, click at (%d,%d), taskbar (%d,%d)-(%d,%d), "
-           L"inStatusBarZone=%d",
+           L"inZone=%d",
            pt.x, pt.y, (int)taskbarRc.left, (int)taskbarRc.top,
-           (int)taskbarRc.right, (int)taskbarRc.bottom, inStatusBarZone);
+           (int)taskbarRc.right, (int)taskbarRc.bottom, inZone);
 
-    if (!inStatusBarZone) {
+    if (!inZone) {
         return false;
     }
 
@@ -170,7 +170,7 @@ bool AdjustShowOptions(DependencyObject* placementTarget,
     // vertically at the taskbar's top edge minus the gap. With the Top
     // placement, XAML opens the menu above this point, centered on it.
     int anchorX = pt.x;
-    int anchorY = taskbarRc.top - g_settings.menuGapFromTaskbar;
+    int anchorY = taskbarRc.top - (int)(g_settings.menuGap * scale + 0.5);
 
     winrt::Windows::Foundation::Point position{
         static_cast<float>((anchorX - islandOrigin.x) / scale -
@@ -187,6 +187,9 @@ bool AdjustShowOptions(DependencyObject* placementTarget,
 
     showOptions->Placement(Controls::Primitives::FlyoutPlacementMode::Top);
     showOptions->Position(position);
+    // Explicitly request the standard (non-transient) mode that the
+    // taskbar's own context menus use.
+    showOptions->ShowMode(Controls::Primitives::FlyoutShowMode::Standard);
 
     return true;
 }
@@ -212,7 +215,18 @@ struct ShowAtHook {
 
         if (placementTarget && showOptions) {
             try {
-                AdjustShowOptions(placementTarget, showOptions);
+                if (AdjustShowOptions(placementTarget, showOptions)) {
+                    // pThis is the projected flyout object, i.e. a pointer
+                    // to its ABI interface pointer.
+                    Controls::Primitives::FlyoutBase flyout = nullptr;
+                    (*(IUnknown**)pThis)
+                        ->QueryInterface(
+                            winrt::guid_of<Controls::Primitives::FlyoutBase>(),
+                            winrt::put_abi(flyout));
+                    if (flyout) {
+                        flyout.AreOpenCloseAnimationsEnabled(true);
+                    }
+                }
             } catch (...) {
                 HRESULT hr = winrt::to_hresult();
                 Wh_Log(L"Error %08X", hr);
@@ -268,6 +282,7 @@ bool ShowTrayContextMenu(void* pThis) {
         return false;
     }
 
+    flyout.AreOpenCloseAnimationsEnabled(true);
     flyout.ShowAt(childElement, options);
     return true;
 }
@@ -396,10 +411,10 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName,
 }
 
 void LoadSettings() {
-    g_settings.statusBarZoneWidth = Wh_GetIntSetting(L"statusBarZoneWidth");
-    g_settings.menuGapFromTaskbar = Wh_GetIntSetting(L"menuGapFromTaskbar");
-    Wh_Log(L"Settings loaded: statusBarZoneWidth=%d menuGapFromTaskbar=%d",
-           g_settings.statusBarZoneWidth, g_settings.menuGapFromTaskbar);
+    g_settings.zoneWidth = Wh_GetIntSetting(L"zoneWidth");
+    g_settings.menuGap = Wh_GetIntSetting(L"menuGap");
+    Wh_Log(L"Settings loaded: zoneWidth=%d menuGap=%d", g_settings.zoneWidth,
+           g_settings.menuGap);
 }
 
 BOOL Wh_ModInit(void) {
