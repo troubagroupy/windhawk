@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.0.0
+// @version         8.1.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -27,8 +27,10 @@ still thought the popup was at its original position, so mouse input was
 hit-tested against the wrong place: the menu items didn't highlight on
 hover and couldn't be clicked.
 
-This version instead hooks `MenuFlyout::ShowAt` in the taskbar's own code and
-changes the placement it asks XAML for: the menu is centered horizontally on
+This version instead opens the tray icons' menus itself (by hooking their
+`ShowContextMenu`, the same way the "Taskbar on top" mod does), and also
+hooks the taskbar's `MenuFlyout::ShowAt` calls, and in both cases sets the
+placement it asks XAML for: the menu is centered horizontally on
 the click and opens just above the taskbar's top edge, with a configurable
 gap. XAML positions the popup itself, so the position and the input stay in
 sync.
@@ -221,6 +223,83 @@ struct ShowAtHook {
     }
 };
 
+FrameworkElement FindChildByName(FrameworkElement element, PCWSTR name) {
+    int childrenCount = Media::VisualTreeHelper::GetChildrenCount(element);
+    for (int i = 0; i < childrenCount; i++) {
+        auto child = Media::VisualTreeHelper::GetChild(element, i)
+                         .try_as<FrameworkElement>();
+        if (child && child.Name() == name) {
+            return child;
+        }
+    }
+
+    return nullptr;
+}
+
+// The tray icons (clock/notification center, and other XAML tray icons) open
+// their context menus in ShowContextMenu, which doesn't go through a ShowAt
+// call with show options that we can adjust. Instead, open the same menu
+// ourselves with our own show options, like the taskbar-on-top mod does.
+bool ShowTrayContextMenu(void* pThis) {
+    FrameworkElement element = nullptr;
+    ((IUnknown**)pThis)[1]->QueryInterface(winrt::guid_of<FrameworkElement>(),
+                                           winrt::put_abi(element));
+    if (!element) {
+        Wh_Log(L"No element");
+        return false;
+    }
+
+    FrameworkElement childElement = FindChildByName(element, L"ContainerGrid");
+    if (!childElement) {
+        Wh_Log(L"No ContainerGrid");
+        return false;
+    }
+
+    auto flyout =
+        Controls::Primitives::FlyoutBase::GetAttachedFlyout(childElement);
+    if (!flyout) {
+        Wh_Log(L"No attached flyout");
+        return false;
+    }
+
+    Controls::Primitives::FlyoutShowOptions options;
+    DependencyObject placementTarget = childElement;
+    if (!AdjustShowOptions(&placementTarget, &options)) {
+        return false;
+    }
+
+    flyout.ShowAt(childElement, options);
+    return true;
+}
+
+using ShowContextMenu_t = void(WINAPI*)(void* pThis);
+
+template <int N>
+struct ShowContextMenuHook {
+    static inline ShowContextMenu_t original;
+
+    static void WINAPI Hook(void* pThis) {
+        Wh_Log(L">");
+
+        bool handled = false;
+        try {
+            handled = ShowTrayContextMenu(pThis);
+        } catch (...) {
+            HRESULT hr = winrt::to_hresult();
+            Wh_Log(L"Error %08X", hr);
+        }
+
+        if (!handled) {
+            original(pThis);
+        }
+    }
+};
+
+constexpr WCHAR kTextIconContentShowContextMenuSymbol[] =
+    LR"(public: void __cdecl winrt::SystemTray::implementation::TextIconContent::ShowContextMenu(void))";
+constexpr WCHAR kDateTimeIconContentShowContextMenuSymbol[] =
+    LR"(public: void __cdecl winrt::SystemTray::implementation::DateTimeIconContent::ShowContextMenu(void))";
+
 constexpr WCHAR kMenuFlyoutShowAtSymbol[] =
     LR"(public: __cdecl winrt::impl::consume_Windows_UI_Xaml_Controls_Primitives_IFlyoutBase5<struct winrt::Windows::UI::Xaml::Controls::MenuFlyout>::ShowAt(struct winrt::Windows::UI::Xaml::DependencyObject const &,struct winrt::Windows::UI::Xaml::Controls::Primitives::FlyoutShowOptions const &)const )";
 constexpr WCHAR kFlyoutBaseShowAtSymbol[] =
@@ -249,6 +328,18 @@ bool HookModuleSymbols(HMODULE module) {
             {kFlyoutBaseShowAtSymbol},
             &ShowAtHook<N * 2 + 1>::original,
             ShowAtHook<N * 2 + 1>::Hook,
+            true,
+        },
+        {
+            {kTextIconContentShowContextMenuSymbol},
+            &ShowContextMenuHook<N * 2>::original,
+            ShowContextMenuHook<N * 2>::Hook,
+            true,
+        },
+        {
+            {kDateTimeIconContentShowContextMenuSymbol},
+            &ShowContextMenuHook<N * 2 + 1>::original,
+            ShowContextMenuHook<N * 2 + 1>::Hook,
             true,
         },
     };
