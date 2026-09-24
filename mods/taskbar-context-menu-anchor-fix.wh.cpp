@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.2.0
+// @version         8.3.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -18,7 +18,7 @@ icons (for example the Notification Center / clock area, "Adjust date and
 time" / "Notification settings") appearing far away from where you actually
 clicked.
 
-## How it works (v8.2)
+## How it works (v8.3)
 
 The taskbar's tray context menus are XAML `MenuFlyout`s. Earlier versions
 moved the finished popup window (`Xaml_WindowedPopupClass`) with
@@ -30,9 +30,11 @@ hover and couldn't be clicked.
 This version instead opens the tray icons' menus itself (by hooking their
 `ShowContextMenu`, the same way the "Taskbar on top" mod does), and also
 hooks the taskbar's `MenuFlyout::ShowAt` calls, and in both cases sets the
-placement it asks XAML for: the menu is centered horizontally on
-the click and opens just above the taskbar's top edge, with a configurable
-gap. XAML positions the popup itself, so the position and the input stay in
+placement it asks XAML for. Menus opened in other ways (for example the
+battery, network and volume icons' menus) are caught by a hook on the XAML
+`MenuFlyout::ShowAt` implementation itself. The menu is centered
+horizontally on the click and opens just above the taskbar's top edge, with
+a configurable gap. XAML positions the popup itself, so the position and the input stay in
 sync.
 
 By default this applies to all the taskbar's XAML menus, including the
@@ -194,6 +196,210 @@ bool AdjustShowOptions(DependencyObject* placementTarget,
     return true;
 }
 
+// Menus that the taskbar opens without going through any of the functions
+// hooked below (for example the battery, network and volume icons' menus)
+// are handled by hooking the XAML MenuFlyout::ShowAt implementation itself.
+// Its address is taken from the vtable of a throwaway MenuFlyout, which is
+// shared by every MenuFlyout instance. The IFlyoutBase vtable starts with the
+// 6 IInspectable slots, then get/put_Placement, add/remove_Opened,
+// add/remove_Closed, add/remove_Opening, then ShowAt. The IFlyoutBase5 vtable
+// starts with the 6 IInspectable slots, then get/put_ShowMode,
+// get_InputDevicePrefersPrimaryCommands, get/put_AreOpenCloseAnimationsEnabled,
+// get_IsOpen, then ShowAt(options).
+constexpr size_t kFlyoutBaseShowAtSlot = 14;
+constexpr size_t kFlyoutBase5ShowAtSlot = 12;
+
+using XamlShowAt_t = HRESULT(WINAPI*)(void* pThis, void* placementTarget);
+using XamlShowAtWithOptions_t = HRESULT(WINAPI*)(void* pThis,
+                                                 void* placementTarget,
+                                                 void* showOptions);
+
+XamlShowAt_t XamlShowAt_Original;
+XamlShowAtWithOptions_t XamlShowAtWithOptions_Original;
+std::atomic<bool> g_xamlShowAtHooksInstalled;
+
+void EnableFlyoutAnimations(void* flyoutAbi) {
+    Controls::Primitives::FlyoutBase flyout = nullptr;
+    ((IUnknown*)flyoutAbi)
+        ->QueryInterface(winrt::guid_of<Controls::Primitives::FlyoutBase>(),
+                         winrt::put_abi(flyout));
+    if (flyout) {
+        flyout.AreOpenCloseAnimationsEnabled(true);
+    }
+}
+
+HRESULT WINAPI XamlShowAtWithOptions_Hook(void* pThis,
+                                          void* placementTarget,
+                                          void* showOptions) {
+    Wh_Log(L">");
+
+    if (placementTarget && showOptions) {
+        try {
+            DependencyObject target = nullptr;
+            winrt::copy_from_abi(target, placementTarget);
+            Controls::Primitives::FlyoutShowOptions options = nullptr;
+            winrt::copy_from_abi(options, showOptions);
+            if (AdjustShowOptions(&target, &options)) {
+                EnableFlyoutAnimations(pThis);
+            }
+        } catch (...) {
+            HRESULT hr = winrt::to_hresult();
+            Wh_Log(L"Error %08X", hr);
+        }
+    }
+
+    return XamlShowAtWithOptions_Original(pThis, placementTarget,
+                                          showOptions);
+}
+
+HRESULT WINAPI XamlShowAt_Hook(void* pThis, void* placementTarget) {
+    Wh_Log(L">");
+
+    if (placementTarget) {
+        try {
+            DependencyObject target = nullptr;
+            winrt::copy_from_abi(target, placementTarget);
+            Controls::Primitives::FlyoutShowOptions options;
+            if (AdjustShowOptions(&target, &options)) {
+                // Show the menu with our options instead, through the
+                // IFlyoutBase5 interface of the same object.
+                Controls::Primitives::IFlyoutBase5 flyout5 = nullptr;
+                ((IUnknown*)pThis)
+                    ->QueryInterface(
+                        winrt::guid_of<Controls::Primitives::IFlyoutBase5>(),
+                        winrt::put_abi(flyout5));
+                if (flyout5) {
+                    EnableFlyoutAnimations(pThis);
+                    return XamlShowAtWithOptions_Original(
+                        winrt::get_abi(flyout5), placementTarget,
+                        winrt::get_abi(options));
+                }
+            }
+        } catch (...) {
+            HRESULT hr = winrt::to_hresult();
+            Wh_Log(L"Error %08X", hr);
+        }
+    }
+
+    return XamlShowAt_Original(pThis, placementTarget);
+}
+
+void* GetVtableSlotFunction(void* interfaceAbi, size_t slotIndex) {
+    void** vtable = *(void***)interfaceAbi;
+    return vtable ? vtable[slotIndex] : nullptr;
+}
+
+// Must run on a thread with XAML initialized (e.g. the taskbar thread).
+void EnsureXamlShowAtHooks() {
+    if (g_xamlShowAtHooksInstalled || g_xamlShowAtHooksInstalled.exchange(true)) {
+        return;
+    }
+
+    try {
+        Controls::MenuFlyout menuFlyout;
+        auto flyoutBase = menuFlyout.as<Controls::Primitives::IFlyoutBase>();
+        auto flyoutBase5 = menuFlyout.as<Controls::Primitives::IFlyoutBase5>();
+
+        void* showAt =
+            GetVtableSlotFunction(winrt::get_abi(flyoutBase),
+                                  kFlyoutBaseShowAtSlot);
+        void* showAtWithOptions =
+            GetVtableSlotFunction(winrt::get_abi(flyoutBase5),
+                                  kFlyoutBase5ShowAtSlot);
+        if (!showAt || !showAtWithOptions || showAt == showAtWithOptions) {
+            Wh_Log(L"Unexpected ShowAt functions %p, %p", showAt,
+                   showAtWithOptions);
+            return;
+        }
+
+        Wh_Log(L"Hooking XAML MenuFlyout ShowAt %p, %p", showAt,
+               showAtWithOptions);
+
+        WindhawkUtils::SetFunctionHook((XamlShowAt_t)showAt, XamlShowAt_Hook,
+                                       &XamlShowAt_Original);
+        WindhawkUtils::SetFunctionHook(
+            (XamlShowAtWithOptions_t)showAtWithOptions,
+            XamlShowAtWithOptions_Hook, &XamlShowAtWithOptions_Original);
+        Wh_ApplyHookOperations();
+    } catch (...) {
+        HRESULT hr = winrt::to_hresult();
+        Wh_Log(L"Failed to hook XAML MenuFlyout ShowAt: %08X", hr);
+    }
+}
+
+HWND FindCurrentProcessTaskbarWnd() {
+    HWND hTaskbarWnd = nullptr;
+
+    EnumWindows(
+        [](HWND hWnd, LPARAM lParam) -> BOOL {
+            DWORD dwProcessId;
+            WCHAR className[32];
+            if (GetWindowThreadProcessId(hWnd, &dwProcessId) &&
+                dwProcessId == GetCurrentProcessId() &&
+                GetClassName(hWnd, className, ARRAYSIZE(className)) &&
+                _wcsicmp(className, L"Shell_TrayWnd") == 0) {
+                *reinterpret_cast<HWND*>(lParam) = hWnd;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&hTaskbarWnd));
+
+    return hTaskbarWnd;
+}
+
+using RunFromWindowThreadProc_t = void (*)(PVOID parameter);
+
+bool RunFromWindowThread(HWND hWnd,
+                         RunFromWindowThreadProc_t proc,
+                         PVOID procParam) {
+    static const UINT runFromWindowThreadRegisteredMsg =
+        RegisterWindowMessage(L"Windhawk_RunFromWindowThread_" WH_MOD_ID);
+
+    struct RUN_FROM_WINDOW_THREAD_PARAM {
+        RunFromWindowThreadProc_t proc;
+        PVOID procParam;
+    };
+
+    DWORD dwThreadId = GetWindowThreadProcessId(hWnd, nullptr);
+    if (dwThreadId == 0) {
+        return false;
+    }
+
+    if (dwThreadId == GetCurrentThreadId()) {
+        proc(procParam);
+        return true;
+    }
+
+    HHOOK hook = SetWindowsHookEx(
+        WH_CALLWNDPROC,
+        [](int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT {
+            if (nCode == HC_ACTION) {
+                const CWPSTRUCT* cwp = (const CWPSTRUCT*)lParam;
+                if (cwp->message == runFromWindowThreadRegisteredMsg) {
+                    RUN_FROM_WINDOW_THREAD_PARAM* param =
+                        (RUN_FROM_WINDOW_THREAD_PARAM*)cwp->lParam;
+                    param->proc(param->procParam);
+                }
+            }
+
+            return CallNextHookEx(nullptr, nCode, wParam, lParam);
+        },
+        nullptr, dwThreadId);
+    if (!hook) {
+        return false;
+    }
+
+    RUN_FROM_WINDOW_THREAD_PARAM param;
+    param.proc = proc;
+    param.procParam = procParam;
+    SendMessage(hWnd, runFromWindowThreadRegisteredMsg, 0, (LPARAM)&param);
+
+    UnhookWindowsHookEx(hook);
+
+    return true;
+}
+
 // The ShowAt call is a C++/WinRT template instantiated separately in every
 // module that uses it, so it may need to be hooked in several modules. Each
 // hooked instance needs its own original function pointer, hence the
@@ -212,6 +418,8 @@ struct ShowAtHook {
         DependencyObject* placementTarget,
         Controls::Primitives::FlyoutShowOptions* showOptions) {
         Wh_Log(L">");
+
+        EnsureXamlShowAtHooks();
 
         if (placementTarget && showOptions) {
             try {
@@ -295,6 +503,8 @@ struct ShowContextMenuHook {
 
     static void WINAPI Hook(void* pThis) {
         Wh_Log(L">");
+
+        EnsureXamlShowAtHooks();
 
         bool handled = false;
         try {
@@ -440,7 +650,49 @@ BOOL Wh_ModInit(void) {
     return TRUE;
 }
 
+HANDLE g_xamlHookThread;
+HANDLE g_xamlHookThreadStopEvent;
+
+// Hooks the XAML MenuFlyout::ShowAt implementation from the taskbar thread,
+// where XAML is initialized. Returns false if the taskbar's XAML isn't there
+// yet.
+bool TryEnsureXamlShowAtHooksFromTaskbarThread() {
+    HWND hTaskbarWnd = FindCurrentProcessTaskbarWnd();
+    if (!hTaskbarWnd ||
+        !FindWindowEx(hTaskbarWnd, nullptr, kContentBridgeClassName,
+                      nullptr)) {
+        return false;
+    }
+
+    return RunFromWindowThread(
+        hTaskbarWnd, [](PVOID) { EnsureXamlShowAtHooks(); }, nullptr);
+}
+
+// If the mod is loaded before the taskbar exists (e.g. while Explorer is
+// starting), wait for it in the background.
+DWORD WINAPI XamlHookThreadProc(LPVOID) {
+    for (int i = 0; i < 120 && !g_xamlShowAtHooksInstalled; i++) {
+        if (WaitForSingleObject(g_xamlHookThreadStopEvent, 1000) !=
+            WAIT_TIMEOUT) {
+            break;
+        }
+
+        TryEnsureXamlShowAtHooksFromTaskbarThread();
+    }
+
+    return 0;
+}
+
 void Wh_ModAfterInit(void) {
+    if (!TryEnsureXamlShowAtHooksFromTaskbarThread()) {
+        Wh_Log(L"Taskbar not ready yet, waiting for it");
+        g_xamlHookThreadStopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+        if (g_xamlHookThreadStopEvent) {
+            g_xamlHookThread = CreateThread(nullptr, 0, XamlHookThreadProc,
+                                            nullptr, 0, nullptr);
+        }
+    }
+
     // Handle modules that were loaded while the mod was initializing.
     bool hooked = false;
     for (PCWSTR moduleName : kModuleNames) {
@@ -451,6 +703,20 @@ void Wh_ModAfterInit(void) {
 
     if (hooked) {
         Wh_ApplyHookOperations();
+    }
+}
+
+void Wh_ModBeforeUninit(void) {
+    if (g_xamlHookThread) {
+        SetEvent(g_xamlHookThreadStopEvent);
+        WaitForSingleObject(g_xamlHookThread, INFINITE);
+        CloseHandle(g_xamlHookThread);
+        g_xamlHookThread = nullptr;
+    }
+
+    if (g_xamlHookThreadStopEvent) {
+        CloseHandle(g_xamlHookThreadStopEvent);
+        g_xamlHookThreadStopEvent = nullptr;
     }
 }
 
