@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.9.0
+// @version         8.10.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -18,7 +18,7 @@ icons (for example the Notification Center / clock area, "Adjust date and
 time" / "Notification settings") appearing far away from where you actually
 clicked.
 
-## How it works (v8.9)
+## How it works (v8.10)
 
 The taskbar's tray context menus are XAML `MenuFlyout`s. Earlier versions
 moved the finished popup window (`Xaml_WindowedPopupClass`) with
@@ -33,7 +33,8 @@ hooks the taskbar's `MenuFlyout::ShowAt` calls, and in both cases sets the
 placement it asks XAML for. Menus opened in other ways (for example the
 battery icon's menu) are caught by a hook on the XAML `MenuFlyout::ShowAt`
 implementation itself. Those are opened unchanged (changing how they're
-shown breaks their open animation) and only moved into place once open. The menu is centered
+shown breaks their open animation), and are moved into place by giving them
+a margin that shifts where XAML places them. The menu is centered
 horizontally on the click and opens just above the taskbar's top edge, with
 a configurable gap. XAML positions the popup itself, so the position and the input stay in
 sync.
@@ -82,6 +83,7 @@ decision made for every menu flyout the taskbar opens.
 
 #include <atomic>
 #include <memory>
+#include <unordered_map>
 
 using namespace winrt::Windows::UI::Xaml;
 
@@ -246,67 +248,96 @@ bool IsSameObject(winrt::Windows::Foundation::IUnknown const& a,
 // open. Once a menu is open, measure where it actually is and move it to
 // where it should be. The popup's offsets are changed, not its window, so
 // that XAML's input handling stays in sync.
-void CorrectOpenMenuPosition(Controls::Primitives::FlyoutBase const& flyout,
-                             MenuAnchor const& a) {
+// Finds the popup and presenter of an open menu flyout.
+bool FindOpenMenu(Controls::Primitives::FlyoutBase const& flyout,
+                  Controls::Primitives::Popup* popupOut,
+                  Controls::MenuFlyoutPresenter* presenterOut) {
     auto menuFlyout = flyout.try_as<Controls::MenuFlyout>();
     auto xamlRoot = flyout.XamlRoot();
     if (!menuFlyout || !xamlRoot || menuFlyout.Items().Size() == 0) {
-        return;
+        return false;
     }
 
-    auto rootContent = xamlRoot.Content();
     auto firstItem = menuFlyout.Items().GetAt(0);
 
     for (auto const& popup :
          Media::VisualTreeHelper::GetOpenPopupsForXamlRoot(xamlRoot)) {
         auto presenter =
             popup.Child().try_as<Controls::MenuFlyoutPresenter>();
-        if (!presenter || presenter.Items().Size() == 0 ||
-            !IsSameObject(presenter.Items().GetAt(0), firstItem)) {
-            continue;
+        if (presenter && presenter.Items().Size() > 0 &&
+            IsSameObject(presenter.Items().GetAt(0), firstItem)) {
+            *popupOut = popup;
+            *presenterOut = presenter;
+            return true;
         }
+    }
 
-        presenter.UpdateLayout();
+    return false;
+}
 
-        auto origin =
-            presenter.TransformToVisual(rootContent)
-                .TransformPoint(winrt::Windows::Foundation::Point{0, 0});
-        double width = presenter.ActualWidth() * a.scale;
-        double height = presenter.ActualHeight() * a.scale;
-        if (width <= 0 || height <= 0) {
-            continue;
-        }
+// The menu's visible rect, in DIPs relative to the taskbar's XAML island.
+bool GetMenuRect(Controls::MenuFlyoutPresenter const& presenter,
+                 winrt::Windows::Foundation::Rect* rect) {
+    auto xamlRoot = presenter.XamlRoot();
+    if (!xamlRoot) {
+        return false;
+    }
 
-        double left = a.islandOrigin.x + origin.X * a.scale;
-        double top = a.islandOrigin.y + origin.Y * a.scale;
+    presenter.UpdateLayout();
 
-        double newLeft = a.anchorX - width / 2;
-        double newTop = a.anchorY - height;
+    auto origin = presenter.TransformToVisual(xamlRoot.Content())
+                      .TransformPoint(winrt::Windows::Foundation::Point{0, 0});
+    float width = static_cast<float>(presenter.ActualWidth());
+    float height = static_cast<float>(presenter.ActualHeight());
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
 
-        if (newLeft > a.workArea.right - width) {
-            newLeft = a.workArea.right - width;
-        }
-        if (newLeft < a.workArea.left) {
-            newLeft = a.workArea.left;
-        }
-        if (newTop < a.workArea.top) {
-            newTop = a.workArea.top;
-        }
+    *rect = {origin.X, origin.Y, width, height};
+    return true;
+}
 
-        double dx = (newLeft - left) / a.scale;
-        double dy = (newTop - top) / a.scale;
+void CorrectOpenMenuPosition(Controls::Primitives::FlyoutBase const& flyout,
+                             MenuAnchor const& a) {
+    Controls::Primitives::Popup popup = nullptr;
+    Controls::MenuFlyoutPresenter presenter = nullptr;
+    winrt::Windows::Foundation::Rect menuRect;
+    if (!FindOpenMenu(flyout, &popup, &presenter) ||
+        !GetMenuRect(presenter, &menuRect)) {
+        return;
+    }
 
-        Wh_Log(L"Open menu at (%f,%f) size %fx%f, moving by (%f,%f) DIPs, "
-               L"animations enabled: %d",
-               left, top, width, height, dx, dy,
-               flyout.AreOpenCloseAnimationsEnabled());
+    double width = menuRect.Width * a.scale;
+    double height = menuRect.Height * a.scale;
+    double left = a.islandOrigin.x + menuRect.X * a.scale;
+    double top = a.islandOrigin.y + menuRect.Y * a.scale;
 
-        if (dx > 0.5 || dx < -0.5) {
-            popup.HorizontalOffset(popup.HorizontalOffset() + dx);
-        }
-        if (dy > 0.5 || dy < -0.5) {
-            popup.VerticalOffset(popup.VerticalOffset() + dy);
-        }
+    double newLeft = a.anchorX - width / 2;
+    double newTop = a.anchorY - height;
+
+    if (newLeft > a.workArea.right - width) {
+        newLeft = a.workArea.right - width;
+    }
+    if (newLeft < a.workArea.left) {
+        newLeft = a.workArea.left;
+    }
+    if (newTop < a.workArea.top) {
+        newTop = a.workArea.top;
+    }
+
+    double dx = (newLeft - left) / a.scale;
+    double dy = (newTop - top) / a.scale;
+
+    Wh_Log(L"Open menu at (%f,%f) size %fx%f, moving by (%f,%f) DIPs, "
+           L"animations enabled: %d",
+           left, top, width, height, dx, dy,
+           flyout.AreOpenCloseAnimationsEnabled());
+
+    if (dx > 0.5 || dx < -0.5) {
+        popup.HorizontalOffset(popup.HorizontalOffset() + dx);
+    }
+    if (dy > 0.5 || dy < -0.5) {
+        popup.VerticalOffset(popup.VerticalOffset() + dy);
     }
 }
 
@@ -375,6 +406,149 @@ void PrepareFlyout(void* flyoutAbi,
         });
 }
 
+// Menus shown by other code (e.g. the battery icon's menu) are opened with
+// their original options: changing how they're shown breaks their open
+// animation. They're placed centered above their target element (the icon),
+// a bit lower than the other menus. To get them to open right where they
+// should, a margin is added to the menu before it opens, which shifts where
+// XAML places its visible part. How XAML places each such menu relative to
+// its target is measured every time it opens, so the margin is exact from
+// the second opening on (the first opening is corrected after it opens).
+struct ForeignMenuState {
+    winrt::weak_ref<Controls::MenuFlyoutPresenter> presenter;
+    Thickness originalMargin{};
+    // Where XAML places the menu without a margin: its horizontal center and
+    // bottom edge relative to the target's horizontal center and top edge,
+    // in DIPs.
+    double offsetX = 0;
+    double offsetY = 0;
+};
+
+// Keyed by the flyout's identity pointer.
+std::unordered_map<void*, ForeignMenuState> g_foreignMenus;
+
+void PrepareForeignFlyout(void* flyoutAbi,
+                          MenuAnchor const& a,
+                          DependencyObject const& placementTarget) {
+    Controls::Primitives::FlyoutBase flyout = nullptr;
+    ((IUnknown*)flyoutAbi)
+        ->QueryInterface(winrt::guid_of<Controls::Primitives::FlyoutBase>(),
+                         winrt::put_abi(flyout));
+    auto targetElement = placementTarget.try_as<FrameworkElement>();
+    if (!flyout || !targetElement || !targetElement.XamlRoot()) {
+        return;
+    }
+
+    void* key = winrt::get_abi(
+        flyout.as<winrt::Windows::Foundation::IUnknown>());
+    ForeignMenuState& state = g_foreignMenus[key];
+
+    // Everything below is in DIPs relative to the taskbar's XAML island.
+    auto targetOrigin =
+        targetElement.TransformToVisual(targetElement.XamlRoot().Content())
+            .TransformPoint(winrt::Windows::Foundation::Point{0, 0});
+    double targetCenterX = targetOrigin.X + targetElement.ActualWidth() / 2;
+    double targetTop = targetOrigin.Y;
+
+    double desiredCenterX = (a.anchorX - a.islandOrigin.x) / a.scale;
+    double desiredBottom = (a.anchorY - a.islandOrigin.y) / a.scale;
+
+    // How far the menu needs to move from where XAML would place it.
+    double shiftX = desiredCenterX - (targetCenterX + state.offsetX);
+    double shiftY = desiredBottom - (targetTop + state.offsetY);
+
+    // A left margin moves the centered menu right by half of it, a bottom
+    // margin moves the menu up by all of it, and vice versa.
+    Thickness margin{
+        shiftX > 0 ? shiftX * 2 : 0,
+        shiftY > 0 ? shiftY : 0,
+        shiftX < 0 ? -shiftX * 2 : 0,
+        shiftY < 0 ? -shiftY : 0,
+    };
+
+    auto presenter = state.presenter.get();
+    if (presenter) {
+        Thickness m = state.originalMargin;
+        presenter.Margin({m.Left + margin.Left, m.Top + margin.Top,
+                          m.Right + margin.Right, m.Bottom + margin.Bottom});
+    } else {
+        margin = {};
+    }
+
+    Wh_Log(L"Foreign menu, known presenter: %d, margin (%f,%f,%f,%f)",
+           !!presenter, margin.Left, margin.Top, margin.Right,
+           margin.Bottom);
+
+    // One-shot handlers, remove themselves when they run.
+    auto openedToken = std::make_shared<winrt::event_token>();
+    *openedToken = flyout.Opened(
+        [openedToken, key, a, margin, targetCenterX, targetTop](
+            winrt::Windows::Foundation::IInspectable const& sender,
+            winrt::Windows::Foundation::IInspectable const&) {
+            auto flyout = sender.try_as<Controls::Primitives::FlyoutBase>();
+            if (!flyout) {
+                return;
+            }
+
+            flyout.Opened(*openedToken);
+
+            try {
+                Controls::Primitives::Popup popup = nullptr;
+                Controls::MenuFlyoutPresenter presenter = nullptr;
+                winrt::Windows::Foundation::Rect menuRect;
+                if (!FindOpenMenu(flyout, &popup, &presenter) ||
+                    !GetMenuRect(presenter, &menuRect)) {
+                    return;
+                }
+
+                ForeignMenuState& state = g_foreignMenus[key];
+                if (!IsSameObject(state.presenter.get(), presenter)) {
+                    state.presenter = winrt::make_weak(presenter);
+                    state.originalMargin = presenter.Margin();
+                }
+
+                // Learn where XAML places this menu without a margin.
+                state.offsetX = menuRect.X + menuRect.Width / 2 -
+                                targetCenterX -
+                                (margin.Left - margin.Right) / 2;
+                state.offsetY = menuRect.Y + menuRect.Height - targetTop +
+                                (margin.Bottom - margin.Top);
+
+                Wh_Log(L"Foreign menu placement offset (%f,%f)",
+                       state.offsetX, state.offsetY);
+
+                // Fix whatever is still off (e.g. on the first opening).
+                CorrectOpenMenuPosition(flyout, a);
+            } catch (...) {
+                HRESULT hr = winrt::to_hresult();
+                Wh_Log(L"Error %08X", hr);
+            }
+        });
+
+    auto closedToken = std::make_shared<winrt::event_token>();
+    *closedToken = flyout.Closed(
+        [closedToken, key](winrt::Windows::Foundation::IInspectable const&
+                               sender,
+                           winrt::Windows::Foundation::IInspectable const&) {
+            auto flyout = sender.try_as<Controls::Primitives::FlyoutBase>();
+            if (!flyout) {
+                return;
+            }
+
+            flyout.Closed(*closedToken);
+
+            try {
+                ForeignMenuState& state = g_foreignMenus[key];
+                if (auto presenter = state.presenter.get()) {
+                    presenter.Margin(state.originalMargin);
+                }
+            } catch (...) {
+                HRESULT hr = winrt::to_hresult();
+                Wh_Log(L"Error %08X", hr);
+            }
+        });
+}
+
 HRESULT WINAPI XamlShowAtWithOptions_Hook(void* pThis,
                                           void* placementTarget,
                                           void* showOptions) {
@@ -387,13 +561,16 @@ HRESULT WINAPI XamlShowAtWithOptions_Hook(void* pThis,
             Controls::Primitives::FlyoutShowOptions options = nullptr;
             winrt::copy_from_abi(options, showOptions);
             // Menus shown by other code (e.g. the battery icon's menu) are
-            // left as they are and only moved once they're open: changing
-            // how they're shown breaks their open animation.
+            // opened with their original options, see PrepareForeignFlyout.
             bool adjustOptions = g_inModShowAt;
             MenuAnchor menuAnchor;
             if (AdjustShowOptions(&target, &options, &menuAnchor,
                                   adjustOptions)) {
-                PrepareFlyout(pThis, menuAnchor, adjustOptions);
+                if (adjustOptions) {
+                    PrepareFlyout(pThis, menuAnchor, true);
+                } else {
+                    PrepareForeignFlyout(pThis, menuAnchor, target);
+                }
             }
         } catch (...) {
             HRESULT hr = winrt::to_hresult();
@@ -408,8 +585,7 @@ HRESULT WINAPI XamlShowAtWithOptions_Hook(void* pThis,
 HRESULT WINAPI XamlShowAt_Hook(void* pThis, void* placementTarget) {
     Wh_Log(L">");
 
-    // Only shown by other code, so like above, the menu is only moved once
-    // it's open.
+    // Only shown by other code, see PrepareForeignFlyout.
     if (placementTarget) {
         try {
             DependencyObject target = nullptr;
@@ -418,7 +594,7 @@ HRESULT WINAPI XamlShowAt_Hook(void* pThis, void* placementTarget) {
             MenuAnchor menuAnchor;
             if (AdjustShowOptions(&target, &options, &menuAnchor,
                                   /*modifyOptions=*/false)) {
-                PrepareFlyout(pThis, menuAnchor, /*adjustedOptions=*/false);
+                PrepareForeignFlyout(pThis, menuAnchor, target);
             }
         } catch (...) {
             HRESULT hr = winrt::to_hresult();
