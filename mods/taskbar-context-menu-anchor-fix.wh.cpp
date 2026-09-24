@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.13.0
+// @version         8.14.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -67,6 +67,12 @@ decision made for every menu flyout the taskbar opens.
     Vertical gap between the bottom of the repositioned menu and the top
     edge of the taskbar, in logical pixels (scaled with the display scale).
     12 matches the gap of the Start menu.
+- slideAnimation: true
+  $name: Slide-in animation
+  $description: >-
+    Open all menus with the slide-in animation that the battery icon's menu
+    uses. When disabled, the other menus keep their roll-out animation (the
+    battery icon's menu can't use it).
 */
 // ==/WindhawkModSettings==
 
@@ -88,6 +94,7 @@ using namespace winrt::Windows::UI::Xaml;
 struct {
     int zoneWidth;
     int menuGap;
+    bool slideAnimation;
 } g_settings;
 
 bool IsTaskbarWindow(HWND hWnd) {
@@ -356,7 +363,9 @@ void PrepareFlyout(void* flyoutAbi,
            winrt::get_class_name(flyout).c_str(),
            flyout.AreOpenCloseAnimationsEnabled(), adjustedOptions);
     if (adjustedOptions) {
-        flyout.AreOpenCloseAnimationsEnabled(true);
+        // With XAML's animations disabled, the menu slides in as a whole,
+        // like the battery icon's menu (which has them disabled natively).
+        flyout.AreOpenCloseAnimationsEnabled(!g_settings.slideAnimation);
     }
 
     // Correct the position in the first layout pass in which the menu is
@@ -622,7 +631,7 @@ struct ShowAtHook {
                             winrt::guid_of<Controls::Primitives::FlyoutBase>(),
                             winrt::put_abi(flyout));
                     if (flyout) {
-                        flyout.AreOpenCloseAnimationsEnabled(true);
+                        flyout.AreOpenCloseAnimationsEnabled(!g_settings.slideAnimation);
                     }
                 }
             } catch (...) {
@@ -682,7 +691,7 @@ bool ShowTrayContextMenu(void* pThis) {
         return false;
     }
 
-    flyout.AreOpenCloseAnimationsEnabled(true);
+    flyout.AreOpenCloseAnimationsEnabled(!g_settings.slideAnimation);
     g_inModShowAt = true;
     try {
         flyout.ShowAt(childElement, options);
@@ -822,8 +831,10 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName,
 void LoadSettings() {
     g_settings.zoneWidth = Wh_GetIntSetting(L"zoneWidth");
     g_settings.menuGap = Wh_GetIntSetting(L"menuGap");
-    Wh_Log(L"Settings loaded: zoneWidth=%d menuGap=%d", g_settings.zoneWidth,
-           g_settings.menuGap);
+    g_settings.slideAnimation = Wh_GetIntSetting(L"slideAnimation");
+    Wh_Log(L"Settings loaded: zoneWidth=%d menuGap=%d slideAnimation=%d",
+           g_settings.zoneWidth, g_settings.menuGap,
+           g_settings.slideAnimation);
 }
 
 BOOL Wh_ModInit(void) {
