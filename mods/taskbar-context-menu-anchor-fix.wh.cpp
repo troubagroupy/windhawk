@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.3.0
+// @version         8.4.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -181,17 +181,24 @@ bool AdjustShowOptions(DependencyObject* placementTarget,
                            targetOrigin.Y),
     };
 
-    Wh_Log(L"Island origin (%d,%d), scale %f, target origin (%f,%f), "
-           L"placement %d -> Top, position (%f,%f)",
-           islandOrigin.x, islandOrigin.y, scale, targetOrigin.X,
-           targetOrigin.Y, (int)showOptions->Placement(), position.X,
-           position.Y);
+    Wh_Log(L"Island origin (%d,%d), scale %f, target %s origin (%f,%f), "
+           L"placement %d -> Top, show mode %d, exclusion rect %d, "
+           L"position (%f,%f)",
+           islandOrigin.x, islandOrigin.y, scale,
+           winrt::get_class_name(targetElement).c_str(), targetOrigin.X,
+           targetOrigin.Y, (int)showOptions->Placement(),
+           (int)showOptions->ShowMode(), !!showOptions->ExclusionRect(),
+           position.X, position.Y);
 
     showOptions->Placement(Controls::Primitives::FlyoutPlacementMode::Top);
     showOptions->Position(position);
     // Explicitly request the standard (non-transient) mode that the
     // taskbar's own context menus use.
     showOptions->ShowMode(Controls::Primitives::FlyoutShowMode::Standard);
+    // Some menus (e.g. the battery/network/volume icons') come with an
+    // exclusion rect covering their button, which XAML keeps the menu clear
+    // of - that would push it away from the position above.
+    showOptions->ExclusionRect(nullptr);
 
     return true;
 }
@@ -224,6 +231,9 @@ void EnableFlyoutAnimations(void* flyoutAbi) {
         ->QueryInterface(winrt::guid_of<Controls::Primitives::FlyoutBase>(),
                          winrt::put_abi(flyout));
     if (flyout) {
+        Wh_Log(L"Flyout %s, animations enabled: %d",
+               winrt::get_class_name(flyout).c_str(),
+               flyout.AreOpenCloseAnimationsEnabled());
         flyout.AreOpenCloseAnimationsEnabled(true);
     }
 }
@@ -269,6 +279,7 @@ HRESULT WINAPI XamlShowAt_Hook(void* pThis, void* placementTarget) {
                         winrt::guid_of<Controls::Primitives::IFlyoutBase5>(),
                         winrt::put_abi(flyout5));
                 if (flyout5) {
+                    Wh_Log(L"Redirecting ShowAt to ShowAt with options");
                     EnableFlyoutAnimations(pThis);
                     return XamlShowAtWithOptions_Original(
                         winrt::get_abi(flyout5), placementTarget,
