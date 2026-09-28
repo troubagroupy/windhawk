@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.20.0
+// @version         8.21.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -986,32 +986,44 @@ bool IsJumpViewWindow(HWND hWnd, PCWSTR source) {
         return false;
     }
 
+    // The jump list's window may belong to another process (its host), with
+    // explorer placing it.
     DWORD processId = 0;
     DWORD threadId = GetWindowThreadProcessId(hWnd, &processId);
-    if (!threadId || processId != GetCurrentProcessId() ||
-        !pGetThreadDescription) {
-        Wh_Log(L"%s on a CoreWindow of another process or no thread info",
-               source);
+    if (!threadId) {
         return false;
     }
 
-    HANDLE thread =
-        OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, threadId);
-    if (!thread) {
-        return false;
+    WCHAR processName[MAX_PATH] = L"?";
+    if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                     FALSE, processId)) {
+        DWORD size = ARRAYSIZE(processName);
+        if (!QueryFullProcessImageName(process, 0, processName, &size)) {
+            wcscpy_s(processName, L"?");
+        }
+        CloseHandle(process);
     }
 
     PWSTR threadDescription = nullptr;
-    HRESULT hr = pGetThreadDescription(thread, &threadDescription);
-    CloseHandle(thread);
-    if (FAILED(hr) || !threadDescription) {
-        return false;
+    if (pGetThreadDescription) {
+        if (HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION,
+                                       FALSE, threadId)) {
+            if (FAILED(pGetThreadDescription(thread, &threadDescription))) {
+                threadDescription = nullptr;
+            }
+            CloseHandle(thread);
+        }
     }
 
-    bool isJumpView = wcscmp(threadDescription, L"JumpViewUI") == 0;
-    Wh_Log(L"%s on a CoreWindow of thread \"%s\", jump list: %d", source,
-           threadDescription, isJumpView);
-    LocalFree(threadDescription);
+    bool isJumpView =
+        threadDescription && wcscmp(threadDescription, L"JumpViewUI") == 0;
+    Wh_Log(L"%s on a CoreWindow of process %s, thread \"%s\", jump list: %d",
+           source, processName, threadDescription ? threadDescription : L"?",
+           isJumpView);
+    if (threadDescription) {
+        LocalFree(threadDescription);
+    }
+
     return isJumpView;
 }
 
