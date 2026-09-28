@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.18.0
+// @version         8.19.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -979,7 +979,7 @@ using GetThreadDescription_t = HRESULT(WINAPI*)(HANDLE hThread,
                                                 PWSTR* ppszThreadDescription);
 GetThreadDescription_t pGetThreadDescription;
 
-bool IsJumpViewWindow(HWND hWnd) {
+bool IsJumpViewWindow(HWND hWnd, PCWSTR source) {
     WCHAR szClassName[64];
     if (!GetClassName(hWnd, szClassName, ARRAYSIZE(szClassName)) ||
         _wcsicmp(szClassName, L"Windows.UI.Core.CoreWindow") != 0) {
@@ -990,6 +990,8 @@ bool IsJumpViewWindow(HWND hWnd) {
     DWORD threadId = GetWindowThreadProcessId(hWnd, &processId);
     if (!threadId || processId != GetCurrentProcessId() ||
         !pGetThreadDescription) {
+        Wh_Log(L"%s on a CoreWindow of another process or no thread info",
+               source);
         return false;
     }
 
@@ -1007,6 +1009,8 @@ bool IsJumpViewWindow(HWND hWnd) {
     }
 
     bool isJumpView = wcscmp(threadDescription, L"JumpViewUI") == 0;
+    Wh_Log(L"%s on a CoreWindow of thread \"%s\", jump list: %d", source,
+           threadDescription, isJumpView);
     LocalFree(threadDescription);
     return isJumpView;
 }
@@ -1085,7 +1089,7 @@ BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
                               int cx,
                               int cy,
                               UINT uFlags) {
-    if (!(uFlags & SWP_NOMOVE) && IsJumpViewWindow(hWnd)) {
+    if (!(uFlags & SWP_NOMOVE) && IsJumpViewWindow(hWnd, L"SetWindowPos")) {
         int width = cx;
         int height = cy;
         if (uFlags & SWP_NOSIZE) {
@@ -1096,15 +1100,37 @@ BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
         }
 
         int newY;
-        if (GetJumpListY(hWnd, X, Y, width, height, &newY) && newY != Y) {
-            Wh_Log(L"Jump list at (%d,%d) size %dx%d, moving to y=%d", X, Y,
-                   width, height, newY);
+        bool adjust = GetJumpListY(hWnd, X, Y, width, height, &newY);
+        Wh_Log(L"Jump list at (%d,%d) size %dx%d, adjust: %d, new y=%d", X,
+               Y, width, height, adjust, adjust ? newY : Y);
+        if (adjust) {
             Y = newY;
         }
     }
 
     return SetWindowPos_Original(hWnd, hWndInsertAfter, X, Y, cx, cy,
                                  uFlags);
+}
+
+using MoveWindow_t = decltype(&MoveWindow);
+MoveWindow_t MoveWindow_Original;
+BOOL WINAPI MoveWindow_Hook(HWND hWnd,
+                            int X,
+                            int Y,
+                            int nWidth,
+                            int nHeight,
+                            BOOL bRepaint) {
+    if (IsJumpViewWindow(hWnd, L"MoveWindow")) {
+        int newY;
+        bool adjust = GetJumpListY(hWnd, X, Y, nWidth, nHeight, &newY);
+        Wh_Log(L"Jump list at (%d,%d) size %dx%d, adjust: %d, new y=%d", X,
+               Y, nWidth, nHeight, adjust, adjust ? newY : Y);
+        if (adjust) {
+            Y = newY;
+        }
+    }
+
+    return MoveWindow_Original(hWnd, X, Y, nWidth, nHeight, bRepaint);
 }
 
 void LoadSettings() {
@@ -1138,6 +1164,8 @@ BOOL Wh_ModInit(void) {
 
     WindhawkUtils::SetFunctionHook(SetWindowPos, SetWindowPos_Hook,
                                    &SetWindowPos_Original);
+    WindhawkUtils::SetFunctionHook(MoveWindow, MoveWindow_Hook,
+                                   &MoveWindow_Original);
 
     // Some of the modules may load later.
     HMODULE kernelBaseModule = GetModuleHandle(L"kernelbase.dll");
