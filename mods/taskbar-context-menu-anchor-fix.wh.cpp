@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.19.0
+// @version         8.20.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -1133,6 +1133,89 @@ BOOL WINAPI MoveWindow_Hook(HWND hWnd,
     return MoveWindow_Original(hWnd, X, Y, nWidth, nHeight, bRepaint);
 }
 
+// Diagnostics: other ways a jump list window might be created or placed.
+
+using CreateWindowExW_t = decltype(&CreateWindowExW);
+CreateWindowExW_t CreateWindowExW_Original;
+HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle,
+                                 LPCWSTR lpClassName,
+                                 LPCWSTR lpWindowName,
+                                 DWORD dwStyle,
+                                 int X,
+                                 int Y,
+                                 int nWidth,
+                                 int nHeight,
+                                 HWND hWndParent,
+                                 HMENU hMenu,
+                                 HINSTANCE hInstance,
+                                 LPVOID lpParam) {
+    HWND hWnd = CreateWindowExW_Original(dwExStyle, lpClassName, lpWindowName,
+                                         dwStyle, X, Y, nWidth, nHeight,
+                                         hWndParent, hMenu, hInstance, lpParam);
+    if (hWnd && IsJumpViewWindow(hWnd, L"CreateWindowExW")) {
+        RECT rc{};
+        GetWindowRect(hWnd, &rc);
+        Wh_Log(L"Jump list window created at (%d,%d)-(%d,%d)", rc.left,
+               rc.top, rc.right, rc.bottom);
+    }
+
+    return hWnd;
+}
+
+using SetWindowPlacement_t = decltype(&SetWindowPlacement);
+SetWindowPlacement_t SetWindowPlacement_Original;
+BOOL WINAPI SetWindowPlacement_Hook(HWND hWnd, const WINDOWPLACEMENT* lpwndpl) {
+    if (lpwndpl && IsJumpViewWindow(hWnd, L"SetWindowPlacement")) {
+        const RECT& rc = lpwndpl->rcNormalPosition;
+        Wh_Log(L"Jump list placement (%d,%d)-(%d,%d)", rc.left, rc.top,
+               rc.right, rc.bottom);
+    }
+
+    return SetWindowPlacement_Original(hWnd, lpwndpl);
+}
+
+using DeferWindowPos_t = decltype(&DeferWindowPos);
+DeferWindowPos_t DeferWindowPos_Original;
+HDWP WINAPI DeferWindowPos_Hook(HDWP hWinPosInfo,
+                                HWND hWnd,
+                                HWND hWndInsertAfter,
+                                int x,
+                                int y,
+                                int cx,
+                                int cy,
+                                UINT uFlags) {
+    if (!(uFlags & SWP_NOMOVE) && IsJumpViewWindow(hWnd, L"DeferWindowPos")) {
+        int newY;
+        bool adjust = GetJumpListY(hWnd, x, y, cx, cy, &newY);
+        Wh_Log(L"Jump list at (%d,%d) size %dx%d, adjust: %d, new y=%d", x, y,
+               cx, cy, adjust, adjust ? newY : y);
+        if (adjust && !(uFlags & SWP_NOSIZE)) {
+            y = newY;
+        }
+    }
+
+    return DeferWindowPos_Original(hWinPosInfo, hWnd, hWndInsertAfter, x, y,
+                                   cx, cy, uFlags);
+}
+
+// Logs the existing jump list windows, e.g. ones created before the mod was
+// loaded.
+void LogExistingJumpListWindows() {
+    EnumWindows(
+        [](HWND hWnd, LPARAM) -> BOOL {
+            if (IsJumpViewWindow(hWnd, L"EnumWindows")) {
+                RECT rc{};
+                GetWindowRect(hWnd, &rc);
+                Wh_Log(L"Existing jump list window (%d,%d)-(%d,%d), visible: "
+                       L"%d",
+                       rc.left, rc.top, rc.right, rc.bottom,
+                       IsWindowVisible(hWnd));
+            }
+            return TRUE;
+        },
+        0);
+}
+
 void LoadSettings() {
     g_settings.zoneWidth = Wh_GetIntSetting(L"zoneWidth");
     g_settings.menuGap = Wh_GetIntSetting(L"menuGap");
@@ -1166,6 +1249,13 @@ BOOL Wh_ModInit(void) {
                                    &SetWindowPos_Original);
     WindhawkUtils::SetFunctionHook(MoveWindow, MoveWindow_Hook,
                                    &MoveWindow_Original);
+    WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExW_Hook,
+                                   &CreateWindowExW_Original);
+    WindhawkUtils::SetFunctionHook(SetWindowPlacement,
+                                   SetWindowPlacement_Hook,
+                                   &SetWindowPlacement_Original);
+    WindhawkUtils::SetFunctionHook(DeferWindowPos, DeferWindowPos_Hook,
+                                   &DeferWindowPos_Original);
 
     // Some of the modules may load later.
     HMODULE kernelBaseModule = GetModuleHandle(L"kernelbase.dll");
@@ -1213,6 +1303,8 @@ DWORD WINAPI XamlHookThreadProc(LPVOID) {
 }
 
 void Wh_ModAfterInit(void) {
+    LogExistingJumpListWindows();
+
     if (!TryEnsureXamlShowAtHooksFromTaskbarThread()) {
         Wh_Log(L"Taskbar not ready yet, waiting for it");
         g_xamlHookThreadStopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
