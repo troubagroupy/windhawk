@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.21.0
+// @version         8.22.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -46,10 +46,6 @@ notification/action center).
 The default gap above the taskbar (12 logical pixels) matches the Start
 menu's.
 
-Jump lists (the menus of taskbar app icons) are kept above the taskbar,
-also when the taskbar is auto-hidden, so that their open animation starts at
-the taskbar's edge instead of the bottom of the screen.
-
 ## If something looks wrong
 
 Turn on logging for this mod and reproduce the issue; the log shows the
@@ -86,14 +82,6 @@ decision made for every menu flyout the taskbar opens.
   $name: Slide-in duration (ms)
   $description: >-
     How long the slide takes. 0 disables the slide.
-- jumpListGap: 0
-  $name: Jump list gap above taskbar
-  $description: >-
-    Vertical gap between the bottom of the jump list (the menu of a taskbar
-    app icon) and the top edge of the taskbar, in logical pixels. The jump
-    list is always kept above the taskbar, also with an auto-hidden taskbar,
-    so that its open animation starts at the taskbar's edge instead of the
-    bottom of the screen.
 */
 // ==/WindhawkModSettings==
 
@@ -119,7 +107,6 @@ struct {
     bool slideAnimation;
     int slideDistance;
     int slideDuration;
-    int jumpListGap;
 } g_settings;
 
 bool IsTaskbarWindow(HWND hWnd) {
@@ -968,273 +955,12 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName,
     return module;
 }
 
-// Jump lists (the menus of taskbar app icons) are separate CoreWindows on a
-// thread named "JumpViewUI". Their window reaches down to the bottom of the
-// work area, which with an auto-hidden taskbar is the bottom of the screen,
-// so their open animation starts there, over the taskbar. Keeping the window
-// above the taskbar makes the animation start at the taskbar's edge, like
-// with a taskbar that isn't auto-hidden.
-
-using GetThreadDescription_t = HRESULT(WINAPI*)(HANDLE hThread,
-                                                PWSTR* ppszThreadDescription);
-GetThreadDescription_t pGetThreadDescription;
-
-bool IsJumpViewWindow(HWND hWnd, PCWSTR source) {
-    WCHAR szClassName[64];
-    if (!GetClassName(hWnd, szClassName, ARRAYSIZE(szClassName)) ||
-        _wcsicmp(szClassName, L"Windows.UI.Core.CoreWindow") != 0) {
-        return false;
-    }
-
-    // The jump list's window may belong to another process (its host), with
-    // explorer placing it.
-    DWORD processId = 0;
-    DWORD threadId = GetWindowThreadProcessId(hWnd, &processId);
-    if (!threadId) {
-        return false;
-    }
-
-    WCHAR processName[MAX_PATH] = L"?";
-    if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
-                                     FALSE, processId)) {
-        DWORD size = ARRAYSIZE(processName);
-        if (!QueryFullProcessImageName(process, 0, processName, &size)) {
-            wcscpy_s(processName, L"?");
-        }
-        CloseHandle(process);
-    }
-
-    PWSTR threadDescription = nullptr;
-    if (pGetThreadDescription) {
-        if (HANDLE thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION,
-                                       FALSE, threadId)) {
-            if (FAILED(pGetThreadDescription(thread, &threadDescription))) {
-                threadDescription = nullptr;
-            }
-            CloseHandle(thread);
-        }
-    }
-
-    bool isJumpView =
-        threadDescription && wcscmp(threadDescription, L"JumpViewUI") == 0;
-    Wh_Log(L"%s on a CoreWindow of process %s, thread \"%s\", jump list: %d",
-           source, processName, threadDescription ? threadDescription : L"?",
-           isJumpView);
-    if (threadDescription) {
-        LocalFree(threadDescription);
-    }
-
-    return isJumpView;
-}
-
-HWND FindTaskbarForMonitor(HMONITOR monitor) {
-    struct Param {
-        HMONITOR monitor;
-        HWND result;
-    } param{monitor, nullptr};
-
-    EnumWindows(
-        [](HWND hWnd, LPARAM lParam) -> BOOL {
-            auto& param = *reinterpret_cast<Param*>(lParam);
-            DWORD processId;
-            if (GetWindowThreadProcessId(hWnd, &processId) &&
-                processId == GetCurrentProcessId() && IsTaskbarWindow(hWnd) &&
-                MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST) ==
-                    param.monitor) {
-                param.result = hWnd;
-                return FALSE;
-            }
-            return TRUE;
-        },
-        reinterpret_cast<LPARAM>(&param));
-
-    return param.result;
-}
-
-// Returns the Y coordinate for a jump list window of the given height, or
-// false to leave it as is.
-bool GetJumpListY(HWND hWnd, int x, int y, int cx, int cy, int* newY) {
-    HMONITOR monitor = MonitorFromPoint({x + cx / 2, y + cy / 2},
-                                        MONITOR_DEFAULTTONEAREST);
-    MONITORINFO monitorInfo{
-        .cbSize = sizeof(MONITORINFO),
-    };
-    if (!GetMonitorInfo(monitor, &monitorInfo)) {
-        return false;
-    }
-
-    HWND hTaskbarWnd = FindTaskbarForMonitor(monitor);
-    RECT taskbarRc{};
-    if (!hTaskbarWnd || !GetWindowRect(hTaskbarWnd, &taskbarRc)) {
-        return false;
-    }
-
-    const RECT& monitorRc = monitorInfo.rcMonitor;
-
-    // Only for a taskbar at the bottom of the screen.
-    if ((taskbarRc.top + taskbarRc.bottom) / 2 <=
-        (monitorRc.top + monitorRc.bottom) / 2) {
-        return false;
-    }
-
-    // An auto-hidden taskbar may currently be (partly) below the screen, use
-    // where its top edge is when it's shown.
-    int taskbarHeight = taskbarRc.bottom - taskbarRc.top;
-    int taskbarTop = taskbarRc.top;
-    if (taskbarTop > monitorRc.bottom - taskbarHeight) {
-        taskbarTop = monitorRc.bottom - taskbarHeight;
-    }
-
-    UINT dpi = GetDpiForWindow(hWnd);
-    int gap = MulDiv(g_settings.jumpListGap, dpi ? dpi : 96, 96);
-
-    *newY = taskbarTop - gap - cy;
-    return true;
-}
-
-using SetWindowPos_t = decltype(&SetWindowPos);
-SetWindowPos_t SetWindowPos_Original;
-BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
-                              HWND hWndInsertAfter,
-                              int X,
-                              int Y,
-                              int cx,
-                              int cy,
-                              UINT uFlags) {
-    if (!(uFlags & SWP_NOMOVE) && IsJumpViewWindow(hWnd, L"SetWindowPos")) {
-        int width = cx;
-        int height = cy;
-        if (uFlags & SWP_NOSIZE) {
-            RECT rc{};
-            GetWindowRect(hWnd, &rc);
-            width = rc.right - rc.left;
-            height = rc.bottom - rc.top;
-        }
-
-        int newY;
-        bool adjust = GetJumpListY(hWnd, X, Y, width, height, &newY);
-        Wh_Log(L"Jump list at (%d,%d) size %dx%d, adjust: %d, new y=%d", X,
-               Y, width, height, adjust, adjust ? newY : Y);
-        if (adjust) {
-            Y = newY;
-        }
-    }
-
-    return SetWindowPos_Original(hWnd, hWndInsertAfter, X, Y, cx, cy,
-                                 uFlags);
-}
-
-using MoveWindow_t = decltype(&MoveWindow);
-MoveWindow_t MoveWindow_Original;
-BOOL WINAPI MoveWindow_Hook(HWND hWnd,
-                            int X,
-                            int Y,
-                            int nWidth,
-                            int nHeight,
-                            BOOL bRepaint) {
-    if (IsJumpViewWindow(hWnd, L"MoveWindow")) {
-        int newY;
-        bool adjust = GetJumpListY(hWnd, X, Y, nWidth, nHeight, &newY);
-        Wh_Log(L"Jump list at (%d,%d) size %dx%d, adjust: %d, new y=%d", X,
-               Y, nWidth, nHeight, adjust, adjust ? newY : Y);
-        if (adjust) {
-            Y = newY;
-        }
-    }
-
-    return MoveWindow_Original(hWnd, X, Y, nWidth, nHeight, bRepaint);
-}
-
-// Diagnostics: other ways a jump list window might be created or placed.
-
-using CreateWindowExW_t = decltype(&CreateWindowExW);
-CreateWindowExW_t CreateWindowExW_Original;
-HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle,
-                                 LPCWSTR lpClassName,
-                                 LPCWSTR lpWindowName,
-                                 DWORD dwStyle,
-                                 int X,
-                                 int Y,
-                                 int nWidth,
-                                 int nHeight,
-                                 HWND hWndParent,
-                                 HMENU hMenu,
-                                 HINSTANCE hInstance,
-                                 LPVOID lpParam) {
-    HWND hWnd = CreateWindowExW_Original(dwExStyle, lpClassName, lpWindowName,
-                                         dwStyle, X, Y, nWidth, nHeight,
-                                         hWndParent, hMenu, hInstance, lpParam);
-    if (hWnd && IsJumpViewWindow(hWnd, L"CreateWindowExW")) {
-        RECT rc{};
-        GetWindowRect(hWnd, &rc);
-        Wh_Log(L"Jump list window created at (%d,%d)-(%d,%d)", rc.left,
-               rc.top, rc.right, rc.bottom);
-    }
-
-    return hWnd;
-}
-
-using SetWindowPlacement_t = decltype(&SetWindowPlacement);
-SetWindowPlacement_t SetWindowPlacement_Original;
-BOOL WINAPI SetWindowPlacement_Hook(HWND hWnd, const WINDOWPLACEMENT* lpwndpl) {
-    if (lpwndpl && IsJumpViewWindow(hWnd, L"SetWindowPlacement")) {
-        const RECT& rc = lpwndpl->rcNormalPosition;
-        Wh_Log(L"Jump list placement (%d,%d)-(%d,%d)", rc.left, rc.top,
-               rc.right, rc.bottom);
-    }
-
-    return SetWindowPlacement_Original(hWnd, lpwndpl);
-}
-
-using DeferWindowPos_t = decltype(&DeferWindowPos);
-DeferWindowPos_t DeferWindowPos_Original;
-HDWP WINAPI DeferWindowPos_Hook(HDWP hWinPosInfo,
-                                HWND hWnd,
-                                HWND hWndInsertAfter,
-                                int x,
-                                int y,
-                                int cx,
-                                int cy,
-                                UINT uFlags) {
-    if (!(uFlags & SWP_NOMOVE) && IsJumpViewWindow(hWnd, L"DeferWindowPos")) {
-        int newY;
-        bool adjust = GetJumpListY(hWnd, x, y, cx, cy, &newY);
-        Wh_Log(L"Jump list at (%d,%d) size %dx%d, adjust: %d, new y=%d", x, y,
-               cx, cy, adjust, adjust ? newY : y);
-        if (adjust && !(uFlags & SWP_NOSIZE)) {
-            y = newY;
-        }
-    }
-
-    return DeferWindowPos_Original(hWinPosInfo, hWnd, hWndInsertAfter, x, y,
-                                   cx, cy, uFlags);
-}
-
-// Logs the existing jump list windows, e.g. ones created before the mod was
-// loaded.
-void LogExistingJumpListWindows() {
-    EnumWindows(
-        [](HWND hWnd, LPARAM) -> BOOL {
-            if (IsJumpViewWindow(hWnd, L"EnumWindows")) {
-                RECT rc{};
-                GetWindowRect(hWnd, &rc);
-                Wh_Log(L"Existing jump list window (%d,%d)-(%d,%d), visible: "
-                       L"%d",
-                       rc.left, rc.top, rc.right, rc.bottom,
-                       IsWindowVisible(hWnd));
-            }
-            return TRUE;
-        },
-        0);
-}
-
 void LoadSettings() {
     g_settings.zoneWidth = Wh_GetIntSetting(L"zoneWidth");
     g_settings.menuGap = Wh_GetIntSetting(L"menuGap");
     g_settings.slideAnimation = Wh_GetIntSetting(L"slideAnimation");
     g_settings.slideDistance = Wh_GetIntSetting(L"slideDistance");
     g_settings.slideDuration = Wh_GetIntSetting(L"slideDuration");
-    g_settings.jumpListGap = Wh_GetIntSetting(L"jumpListGap");
     Wh_Log(L"Settings loaded: zoneWidth=%d menuGap=%d slideAnimation=%d",
            g_settings.zoneWidth, g_settings.menuGap,
            g_settings.slideAnimation);
@@ -1250,24 +976,6 @@ BOOL Wh_ModInit(void) {
             HookModuleIfNeeded(module);
         }
     }
-
-    if (HMODULE kernel32Module = LoadLibraryEx(L"kernel32.dll", nullptr,
-                                               LOAD_LIBRARY_SEARCH_SYSTEM32)) {
-        pGetThreadDescription = (GetThreadDescription_t)GetProcAddress(
-            kernel32Module, "GetThreadDescription");
-    }
-
-    WindhawkUtils::SetFunctionHook(SetWindowPos, SetWindowPos_Hook,
-                                   &SetWindowPos_Original);
-    WindhawkUtils::SetFunctionHook(MoveWindow, MoveWindow_Hook,
-                                   &MoveWindow_Original);
-    WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExW_Hook,
-                                   &CreateWindowExW_Original);
-    WindhawkUtils::SetFunctionHook(SetWindowPlacement,
-                                   SetWindowPlacement_Hook,
-                                   &SetWindowPlacement_Original);
-    WindhawkUtils::SetFunctionHook(DeferWindowPos, DeferWindowPos_Hook,
-                                   &DeferWindowPos_Original);
 
     // Some of the modules may load later.
     HMODULE kernelBaseModule = GetModuleHandle(L"kernelbase.dll");
@@ -1315,8 +1023,6 @@ DWORD WINAPI XamlHookThreadProc(LPVOID) {
 }
 
 void Wh_ModAfterInit(void) {
-    LogExistingJumpListWindows();
-
     if (!TryEnsureXamlShowAtHooksFromTaskbarThread()) {
         Wh_Log(L"Taskbar not ready yet, waiting for it");
         g_xamlHookThreadStopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
