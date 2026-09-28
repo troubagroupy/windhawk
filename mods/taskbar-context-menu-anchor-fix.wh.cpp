@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.23.0
+// @version         8.24.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -78,6 +78,12 @@ decision made for every menu flyout the taskbar opens.
   $description: >-
     How far below its final position a menu starts sliding up, in logical
     pixels.
+- jumpListBelowTaskbar: true
+  $name: Jump list below the taskbar
+  $description: >-
+    Keep the jump list (the menu of a taskbar app icon) below the taskbar in
+    the window order, so that with an auto-hidden taskbar its open animation
+    slides in from behind the taskbar instead of over it.
 - slideDuration: 250
   $name: Slide-in duration (ms)
   $description: >-
@@ -107,6 +113,7 @@ struct {
     bool slideAnimation;
     int slideDistance;
     int slideDuration;
+    bool jumpListBelowTaskbar;
 } g_settings;
 
 bool IsTaskbarWindow(HWND hWnd) {
@@ -955,6 +962,136 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName,
     return module;
 }
 
+// Jump lists are CoreWindows on a thread named "JumpViewUI" of
+// ShellExperienceHost.exe, placed by explorer. Without an auto-hidden
+// taskbar, their open animation slides in from behind the taskbar; with an
+// auto-hidden one they end up above the taskbar in the window order, so the
+// animation is drawn over it. Keep them below the taskbar.
+
+using GetThreadDescription_t = HRESULT(WINAPI*)(HANDLE hThread,
+                                                PWSTR* ppszThreadDescription);
+GetThreadDescription_t pGetThreadDescription;
+
+using GetWindowBand_t = BOOL(WINAPI*)(HWND hWnd, DWORD* pdwBand);
+GetWindowBand_t pGetWindowBand;
+
+bool IsJumpViewWindow(HWND hWnd) {
+    WCHAR szClassName[64];
+    if (!GetClassName(hWnd, szClassName, ARRAYSIZE(szClassName)) ||
+        _wcsicmp(szClassName, L"Windows.UI.Core.CoreWindow") != 0) {
+        return false;
+    }
+
+    DWORD threadId = GetWindowThreadProcessId(hWnd, nullptr);
+    if (!threadId || !pGetThreadDescription) {
+        return false;
+    }
+
+    HANDLE thread =
+        OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, threadId);
+    if (!thread) {
+        return false;
+    }
+
+    PWSTR threadDescription = nullptr;
+    HRESULT hr = pGetThreadDescription(thread, &threadDescription);
+    CloseHandle(thread);
+    if (FAILED(hr) || !threadDescription) {
+        return false;
+    }
+
+    bool isJumpView = wcscmp(threadDescription, L"JumpViewUI") == 0;
+    LocalFree(threadDescription);
+    return isJumpView;
+}
+
+HWND FindTaskbarForWindow(HWND hWnd) {
+    struct Param {
+        HMONITOR monitor;
+        HWND result;
+    } param{MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST), nullptr};
+
+    EnumWindows(
+        [](HWND hWnd, LPARAM lParam) -> BOOL {
+            auto& param = *reinterpret_cast<Param*>(lParam);
+            DWORD processId;
+            if (GetWindowThreadProcessId(hWnd, &processId) &&
+                processId == GetCurrentProcessId() && IsTaskbarWindow(hWnd) &&
+                MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST) ==
+                    param.monitor) {
+                param.result = hWnd;
+                return FALSE;
+            }
+            return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&param));
+
+    return param.result;
+}
+
+bool IsWindowAbove(HWND hWnd, HWND hWndOther) {
+    for (HWND h = GetWindow(hWnd, GW_HWNDPREV); h;
+         h = GetWindow(h, GW_HWNDPREV)) {
+        if (h == hWndOther) {
+            return true;
+        }
+    }
+    return false;
+}
+
+using SetWindowPos_t = decltype(&SetWindowPos);
+SetWindowPos_t SetWindowPos_Original;
+
+void PlaceJumpListBelowTaskbar(HWND hJumpList) {
+    HWND hTaskbarWnd = FindTaskbarForWindow(hJumpList);
+    if (!hTaskbarWnd) {
+        return;
+    }
+
+    DWORD jumpListBand = 0, taskbarBand = 0;
+    if (pGetWindowBand) {
+        pGetWindowBand(hJumpList, &jumpListBand);
+        pGetWindowBand(hTaskbarWnd, &taskbarBand);
+    }
+
+    bool taskbarAboveBefore = IsWindowAbove(hJumpList, hTaskbarWnd);
+
+    BOOL result = TRUE;
+    if (g_settings.jumpListBelowTaskbar && !taskbarAboveBefore) {
+        result = SetWindowPos_Original(
+            hJumpList, hTaskbarWnd, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    }
+
+    Wh_Log(L"Jump list band %u topmost %d, taskbar band %u topmost %d, "
+           L"taskbar above: %d -> %d (result %d)",
+           jumpListBand,
+           !!(GetWindowLong(hJumpList, GWL_EXSTYLE) & WS_EX_TOPMOST),
+           taskbarBand,
+           !!(GetWindowLong(hTaskbarWnd, GWL_EXSTYLE) & WS_EX_TOPMOST),
+           taskbarAboveBefore, IsWindowAbove(hJumpList, hTaskbarWnd), result);
+}
+
+BOOL WINAPI SetWindowPos_Hook(HWND hWnd,
+                              HWND hWndInsertAfter,
+                              int X,
+                              int Y,
+                              int cx,
+                              int cy,
+                              UINT uFlags) {
+    BOOL ret = SetWindowPos_Original(hWnd, hWndInsertAfter, X, Y, cx, cy,
+                                     uFlags);
+
+    if (IsJumpViewWindow(hWnd)) {
+        Wh_Log(L"Jump list SetWindowPos (%d,%d) %dx%d, insert after %p, "
+               L"flags %08X",
+               X, Y, cx, cy, hWndInsertAfter, uFlags);
+        PlaceJumpListBelowTaskbar(hWnd);
+    }
+
+    return ret;
+}
+
 // Diagnostics: the anchor point that explorer computes for a taskbar app
 // icon's jump list and passes to its host (ShellExperienceHost.exe).
 using CTaskListWnd_ComputeJumpViewPosition_t =
@@ -1029,6 +1166,8 @@ void LoadSettings() {
     g_settings.slideAnimation = Wh_GetIntSetting(L"slideAnimation");
     g_settings.slideDistance = Wh_GetIntSetting(L"slideDistance");
     g_settings.slideDuration = Wh_GetIntSetting(L"slideDuration");
+    g_settings.jumpListBelowTaskbar =
+        Wh_GetIntSetting(L"jumpListBelowTaskbar");
     Wh_Log(L"Settings loaded: zoneWidth=%d menuGap=%d slideAnimation=%d",
            g_settings.zoneWidth, g_settings.menuGap,
            g_settings.slideAnimation);
@@ -1042,6 +1181,21 @@ BOOL Wh_ModInit(void) {
     if (!HookTaskbarDllSymbols()) {
         Wh_Log(L"Failed to hook taskbar.dll");
     }
+
+    if (HMODULE kernel32Module = LoadLibraryEx(L"kernel32.dll", nullptr,
+                                               LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+        pGetThreadDescription = (GetThreadDescription_t)GetProcAddress(
+            kernel32Module, "GetThreadDescription");
+    }
+
+    if (HMODULE user32Module = LoadLibraryEx(L"user32.dll", nullptr,
+                                             LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+        pGetWindowBand =
+            (GetWindowBand_t)GetProcAddress(user32Module, "GetWindowBand");
+    }
+
+    WindhawkUtils::SetFunctionHook(SetWindowPos, SetWindowPos_Hook,
+                                   &SetWindowPos_Original);
 
     for (PCWSTR moduleName : kModuleNames) {
         if (HMODULE module = GetModuleHandle(moduleName)) {
