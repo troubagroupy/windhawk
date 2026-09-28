@@ -2,7 +2,7 @@
 // @id              taskbar-context-menu-anchor-fix
 // @name            Taskbar context menu anchor fix
 // @description     Repositions taskbar tray icon context menus (e.g. Notification/Action Center) to open near the click point instead of a wrong fixed position
-// @version         8.22.0
+// @version         8.23.0
 // @author          kuba
 // @include         explorer.exe
 // @architecture    x86-64
@@ -955,6 +955,74 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName,
     return module;
 }
 
+// Diagnostics: the anchor point that explorer computes for a taskbar app
+// icon's jump list and passes to its host (ShellExperienceHost.exe).
+using CTaskListWnd_ComputeJumpViewPosition_t =
+    HRESULT(WINAPI*)(void* pThis,
+                     void* taskBtnGroup,
+                     int param2,
+                     winrt::Windows::Foundation::Point* point,
+                     HorizontalAlignment* horizontalAlignment,
+                     VerticalAlignment* verticalAlignment);
+CTaskListWnd_ComputeJumpViewPosition_t
+    CTaskListWnd_ComputeJumpViewPosition_Original;
+HRESULT WINAPI CTaskListWnd_ComputeJumpViewPosition_Hook(
+    void* pThis,
+    void* taskBtnGroup,
+    int param2,
+    winrt::Windows::Foundation::Point* point,
+    HorizontalAlignment* horizontalAlignment,
+    VerticalAlignment* verticalAlignment) {
+    HRESULT ret = CTaskListWnd_ComputeJumpViewPosition_Original(
+        pThis, taskBtnGroup, param2, point, horizontalAlignment,
+        verticalAlignment);
+
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    HWND hTaskbarWnd = GetAncestor(WindowFromPoint(cursor), GA_ROOT);
+    RECT taskbarRc{};
+    RECT bridgeRc{};
+    if (hTaskbarWnd && IsTaskbarWindow(hTaskbarWnd)) {
+        GetWindowRect(hTaskbarWnd, &taskbarRc);
+        if (HWND hBridgeWnd = FindWindowEx(hTaskbarWnd, nullptr,
+                                           kContentBridgeClassName, nullptr)) {
+            GetWindowRect(hBridgeWnd, &bridgeRc);
+        }
+    }
+
+    Wh_Log(L"Jump list anchor: param %d, point (%f,%f), alignment h=%d v=%d, "
+           L"cursor (%d,%d), taskbar (%d,%d)-(%d,%d), island (%d,%d)-(%d,%d)",
+           param2, point ? point->X : 0.f, point ? point->Y : 0.f,
+           horizontalAlignment ? (int)*horizontalAlignment : -1,
+           verticalAlignment ? (int)*verticalAlignment : -1, cursor.x,
+           cursor.y, taskbarRc.left, taskbarRc.top, taskbarRc.right,
+           taskbarRc.bottom, bridgeRc.left, bridgeRc.top, bridgeRc.right,
+           bridgeRc.bottom);
+
+    return ret;
+}
+
+bool HookTaskbarDllSymbols() {
+    HMODULE module =
+        LoadLibraryEx(L"taskbar.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!module) {
+        Wh_Log(L"Failed to load taskbar.dll");
+        return false;
+    }
+
+    WindhawkUtils::SYMBOL_HOOK taskbarDllHooks[] = {
+        {
+            {LR"(protected: long __cdecl CTaskListWnd::_ComputeJumpViewPosition(struct ITaskBtnGroup *,int,struct Windows::Foundation::Point &,enum Windows::UI::Xaml::HorizontalAlignment &,enum Windows::UI::Xaml::VerticalAlignment &)const )"},
+            &CTaskListWnd_ComputeJumpViewPosition_Original,
+            CTaskListWnd_ComputeJumpViewPosition_Hook,
+            true,
+        },
+    };
+
+    return WindhawkUtils::HookSymbols(module, taskbarDllHooks,
+                                      ARRAYSIZE(taskbarDllHooks));
+}
+
 void LoadSettings() {
     g_settings.zoneWidth = Wh_GetIntSetting(L"zoneWidth");
     g_settings.menuGap = Wh_GetIntSetting(L"menuGap");
@@ -970,6 +1038,10 @@ BOOL Wh_ModInit(void) {
     Wh_Log(L"Init");
 
     LoadSettings();
+
+    if (!HookTaskbarDllSymbols()) {
+        Wh_Log(L"Failed to hook taskbar.dll");
+    }
 
     for (PCWSTR moduleName : kModuleNames) {
         if (HMODULE module = GetModuleHandle(moduleName)) {
